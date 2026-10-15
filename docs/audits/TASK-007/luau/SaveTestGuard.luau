@@ -1,0 +1,72 @@
+-- ServerStorage.TestOnly.SaveTestGuard
+-- SAVETEST ONLY. Never copy this into the production place.
+--
+-- Purpose: refuse to initialize ProfileStore or touch any DataStore unless BOTH exact SaveTest IDs match,
+-- the production IDs do not, the store name is a TEST_LK_ name, and the owner has flipped the approval flag.
+-- Nothing in the game requires this module. It is only used by hand-run test code.
+
+local Guard = {}
+
+Guard.SAVETEST_PLACE_ID = 128620546156998
+Guard.SAVETEST_GAME_ID = 10770892134 -- universe id
+
+Guard.PROD_PLACE_ID = 132065051336560
+Guard.PROD_GAME_ID = 10769064643
+
+-- Test-only store names (all start with TEST_LK_)
+Guard.TEST_STORE_NAME = "TEST_LK_ProfileStore_v2" -- ProfileStore profiles
+Guard.TEST_V1_FIXTURE_STORE = "TEST_LK_V1Fixtures" -- legacy-shaped fixtures for the importer / overwrite tests
+Guard.CANARY_STORE_NAME = "TEST_LK_IsolationCanary" -- already holds the approved canary marker
+
+-- Never point anything at these (the production store name):
+Guard.FORBIDDEN_STORE_NAMES = {
+	["LighthouseKeepers_PlayerData_v1"] = true,
+	["LighthouseKeepers_PlayerData_v2"] = true,
+}
+
+-- Flip to true ONLY with the owner's explicit written approval of the specific real DataStore writes.
+-- While false, requireRealProfileStore() always errors, so the real ProfileStore module (whose Studio
+-- initialization probe performs a real write to a store named "____PS") can never be loaded by accident.
+Guard.REAL_DATASTORE_APPROVED = false
+
+function Guard.assertSaveTest()
+	assert(
+		game.PlaceId == Guard.SAVETEST_PLACE_ID,
+		"SaveTestGuard ABORT: PlaceId is not the SaveTest place: " .. tostring(game.PlaceId)
+	)
+	assert(
+		game.GameId == Guard.SAVETEST_GAME_ID,
+		"SaveTestGuard ABORT: GameId is not the SaveTest universe: " .. tostring(game.GameId)
+	)
+	assert(
+		game.PlaceId ~= Guard.PROD_PLACE_ID and game.GameId ~= Guard.PROD_GAME_ID,
+		"SaveTestGuard ABORT: production IDs detected"
+	)
+	return true
+end
+
+function Guard.assertStoreName(storeName)
+	assert(type(storeName) == "string", "SaveTestGuard ABORT: store name must be a string")
+	assert(string.sub(storeName, 1, 8) == "TEST_LK_", "SaveTestGuard ABORT: store name must start with TEST_LK_: " .. storeName)
+	assert(Guard.FORBIDDEN_STORE_NAMES[storeName] ~= true, "SaveTestGuard ABORT: forbidden store name: " .. storeName)
+	return true
+end
+
+-- The ONLY sanctioned way to load the real ProfileStore module.
+function Guard.requireRealProfileStore(profileStoreModule)
+	Guard.assertSaveTest()
+	assert(
+		Guard.REAL_DATASTORE_APPROVED == true,
+		"SaveTestGuard ABORT: real DataStore writes are not approved (REAL_DATASTORE_APPROVED is false)"
+	)
+	return require(profileStoreModule)
+end
+
+-- Creates a store through the real ProfileStore module, after every check.
+function Guard.newRealStore(profileStoreModule, storeName, template)
+	Guard.assertStoreName(storeName)
+	local ProfileStore = Guard.requireRealProfileStore(profileStoreModule)
+	return ProfileStore.New(storeName, template)
+end
+
+return Guard

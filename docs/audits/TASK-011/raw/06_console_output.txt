@@ -1,0 +1,47 @@
+Captured twice: once in Play after the terminal status (before Stop), once in Edit after Stop. Both captures were identical:
+
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'
+Stack Begin
+Script 'ReplicatedStorage.Shared.SoundFx', Line 105
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Coach', Line 24
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Inventory', Line 30
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Vitals', Line 10
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Results', Line 23
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Main', Line 15
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Storm', Line 12
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Departure', Line 23
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Menus', Line 28
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Shop', Line 29
+Stack End
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")'
+Stack Begin
+Script 'Players.Lighthouse8282.PlayerScripts.Client.Hud', Line 34
+Stack End
+[ProfileStore]: Roblox API services available - data will be saved

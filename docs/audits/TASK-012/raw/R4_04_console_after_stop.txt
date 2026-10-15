@@ -1,0 +1,20 @@
+Captured in Play before Stop (identical except for the last three lines), and again in Edit after Stop:
+
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'  (ReplicatedStorage.Shared.SoundFx, Line 105)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")' (Client.Vitals, Line 10)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'  (Client.Inventory, Line 30)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'  (Client.Shop, Line 29)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'  (Client.Results, Line 23)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")' (Client.Coach, Line 24)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")' (Client.Hud, Line 34)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")' (Client.Storm, Line 12)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("Remotes")'  (Client.Departure, Line 23)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")' (Client.Main, Line 15)
+Infinite yield possible on 'ReplicatedStorage:WaitForChild("GameState")' (Client.Menus, Line 28)
+[ProfileStore]: Roblox API services available - data will be saved
+--- the next three lines appeared only after Stop Play ---
+[R4] BindToClose observer started
+[R4] OnSessionEnd fired (the release write follows it)
+[R4] observer: released=true after 0.68s storedPearls=40 loadCount=1
+
+(The client lines are written as "Players.Lighthouse8282.PlayerScripts.Client.X" with Stack Begin/End markers in the raw output; they are shortened here. No errors.)

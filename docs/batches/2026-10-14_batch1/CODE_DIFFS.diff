@@ -1,0 +1,238 @@
+--- before/ReplicatedStorage_Shared_Config.luau
++++ after/ReplicatedStorage_Shared_Config.luau
+@@ -46,6 +46,7 @@
+ 	FUEL_DRAIN_PER_SECOND = 1.2, -- only drains at night; a full tank lasts ~80 s on the wide beam
+ 	FUEL_PER_REFILL = 40, -- one barrel of oil
+ 	FUEL_DRAIN_BY_CREW_SIZE = { 0.7, 0.85, 1, 1 }, -- drain multiplier for 1, 2, 3, 4 players (solo can't refuel and keep the lamp at once)
++	MAX_CREW = 4, -- batch 1: at most 4 Keepers sail together; anyone else waits on the ship for the next voyage
+ 	DAWN_LOOT_SECONDS = 25, -- leftover loot stays this long into the day at full value (was 10; owner, Oct 12)
+ 	DAWN_LOOT_FRACTION = 0.5, -- at dawn the tide brings leftover loot to the crew at this fraction of its value
+ 	DARK_GRACE_SECONDS = 10, -- how long the lamp can be out before the run is lost
+--- before/ServerScriptService_Server_LampService.luau
++++ after/ServerScriptService_Server_LampService.luau
+@@ -280,8 +280,14 @@
+ 				rate *= 0.75 -- evolution (Shared.Upgrades.EVOLUTIONS): focused beam burns 25% less
+ 			end
+ 		end
+-		-- Smaller crews burn less fuel
+-		local crewSize = math.clamp(#Players:GetPlayers(), 1, #Config.FUEL_DRAIN_BY_CREW_SIZE)
++		-- Smaller crews burn less fuel. Counts the crew (Ready players), not everyone on the server (batch 1)
++		local crew = 0
++		for _, p in Players:GetPlayers() do
++			if p:GetAttribute("Ready") then
++				crew += 1
++			end
++		end
++		local crewSize = math.clamp(crew, 1, #Config.FUEL_DRAIN_BY_CREW_SIZE)
+ 		rate *= Config.FUEL_DRAIN_BY_CREW_SIZE[crewSize]
+ 		rate *= state:GetAttribute("ForecastFuelMult") or 1 -- storm forecast (Leaky stores)
+ 		fuel = math.max(0, fuel - rate * dt)
+--- before/ServerScriptService_Server_Main.server.luau
++++ after/ServerScriptService_Server_Main.server.luau
+@@ -642,9 +642,25 @@
+ 	end
+ end)
+ 
+--- Joining the crew (ship's wheel, or automatically on a first voyage)
++-- Crew cap (batch 1): at most Config.MAX_CREW players sail; anyone else waits on the ship
++local function crewIsFull(player)
++	local n = 0
++	for _, p in Players:GetPlayers() do
++		if p ~= player and p:GetAttribute("Ready") then
++			n += 1
++		end
++	end
++	return n >= (Config.MAX_CREW or 4)
++end
++
++-- Joining the crew (ship's wheel, or automatically on a first voyage). Returns false if the crew is full.
+ local function joinCrew(player, via)
+ 	local phase = stateFolder:GetAttribute("Phase")
++	if crewIsFull(player) then
++		LampService.notify(player, string.format("The crew is full (%d Keepers). Wait on the ship: you can join the next voyage.", Config.MAX_CREW or 4))
++		EventLog.log("CrewFull", { player = player.Name, via = via })
++		return false
++	end
+ 	player:SetAttribute("Ready", true)
+ 	EventLog.log("PlayerReady", { player = player.Name, via = via })
+ 	EventLog.mark(player, "crew")
+@@ -654,6 +670,7 @@
+ 	else
+ 		LampService.notify(player, if via == "first voyage" then "The storm is coming. The light needs a keeper: the ship sets sail soon." else "You joined the crew! The ship sets sail soon.")
+ 	end
++	return true
+ end
+ 
+ -- The ship's wheel: join or leave the crew
+@@ -688,6 +705,7 @@
+ 		and (profileState == "saved" or profileState == "memory")
+ 		and player:GetAttribute("RunsCompleted") == 0
+ 		and not player:GetAttribute("InLobby")
++		and not crewIsFull(player) -- batch 1: a full crew sends a first-timer to the title instead
+ 	EventLog.setRoute(player, if fast then "fast" elseif profileState == "failed" then "failed-load" elseif profileState == nil then "slow-load" else "title")
+ 	if not fast then
+ 		player:SetAttribute("Route", "title")
+--- before/StarterPlayer_StarterPlayerScripts_Client_Coach.client.luau
++++ after/StarterPlayer_StarterPlayerScripts_Client_Coach.client.luau
+@@ -189,7 +189,7 @@
+ 		id = "focus",
+ 		icon = "danger",
+ 		text = "Big one! Focus burns it — uses fuel fast",
+-		keys = { keyboard = "F", touch = "Focus" },
++		keys = { keyboard = "F", touch = "Focus", gamepad = Enum.KeyCode.ButtonY }, -- batch 1: controller hint
+ 		when = function()
+ 			return isKeeper() and bigMonsterOut() and state:GetAttribute("BeamMode") ~= "focused"
+ 		end,
+@@ -198,7 +198,7 @@
+ 		id = "aim",
+ 		icon = "lamp",
+ 		text = "Aim the light at the crabs",
+-		keys = { keyboard = "Mouse", touch = "Drag" },
++		keys = { keyboard = "Mouse", touch = "Drag", gamepad = Enum.KeyCode.Thumbstick1 }, -- batch 1: controller hint
+ 		when = function()
+ 			return isKeeper() and creaturesOut()
+ 		end,
+--- before/StarterPlayer_StarterPlayerScripts_Client_Hud.client.luau
++++ after/StarterPlayer_StarterPlayerScripts_Client_Hud.client.luau
+@@ -544,8 +544,14 @@
+ 	return "keyboard"
+ end
+ 
+-local function keySuffix(key)
+-	return if inputMode() == "keyboard" then "  ·  " .. key else ""
++local function keySuffix(key, padKey)
++	local mode = inputMode()
++	if mode == "keyboard" then
++		return "  ·  " .. key
++	elseif mode == "gamepad" and padKey then
++		return "  ·  " .. padKey -- batch 1: controller hints for the Keeper buttons
++	end
++	return ""
+ end
+ 
+ -- voyage status ------------------------------------------------------
+@@ -654,9 +660,9 @@
+ 	local me = keeperId == player.UserId
+ 	keeperRow.Visible = me
+ 	focusWarn.Visible = me and mode == "focused" and not compact
+-	beamButton.Text = (if mode == "focused" then "WIDE BEAM" else "FOCUS BEAM") .. keySuffix("F")
++	beamButton.Text = (if mode == "focused" then "WIDE BEAM" else "FOCUS BEAM") .. keySuffix("F", "Y")
+ 	beamButton:SetAttribute("BaseText", beamButton.Text)
+-	leaveButton.Text = "LEAVE LAMP" .. keySuffix("Q")
++	leaveButton.Text = "LEAVE LAMP" .. keySuffix("Q", "B")
+ 	leaveButton:SetAttribute("BaseText", leaveButton.Text)
+ end
+ 
+--- before/StarterPlayer_StarterPlayerScripts_Client_Main.client.luau
++++ after/StarterPlayer_StarterPlayerScripts_Client_Main.client.luau
+@@ -90,6 +90,12 @@
+ local pendingAngle = nil
+ local lastSent = 0
+ local SEND_INTERVAL = 0.05
++-- batch 1: controller aim (GP-44) and held-aim keep-alive (GP-3)
++local lastAim = nil -- the last angle aimed by any input
++local stickHeld = false -- a thumbstick is pushed past the dead zone
++local heldTouches = {} -- touches currently aiming (not on a button)
++local STICK_DEADZONE = 0.35
++local HOLD_RESEND = 1 -- seconds: a held finger or stick re-sends its aim so the idle timer sees the Keeper
+ 
+ -- While at the lamp the Keeper can't walk (server sets WalkSpeed 0), so the movement controls
+ -- are hidden: on phones the joystick and jump button would otherwise sit under the aiming thumb.
+@@ -147,6 +153,9 @@
+ 		enterKeeperView()
+ 	else
+ 		pendingAngle = nil
++		lastAim = nil
++		stickHeld = false
++		heldTouches = {}
+ 		exitKeeperView()
+ 	end
+ end
+@@ -170,6 +179,11 @@
+ 	end
+ 	-- The beam points along -Z at angle 0, so solve for the yaw that faces (dx, dz)
+ 	pendingAngle = math.deg(math.atan2(-dx, -dz))
++	lastAim = pendingAngle
++end
++
++local function isStick(input)
++	return input.KeyCode == Enum.KeyCode.Thumbstick1 or input.KeyCode == Enum.KeyCode.Thumbstick2
+ end
+ 
+ UserInputService.InputChanged:Connect(function(input, gameProcessed)
+@@ -180,6 +194,17 @@
+ 		aimAt(input.Position)
+ 	elseif input.UserInputType == Enum.UserInputType.Touch and not gameProcessed then
+ 		aimAt(input.Position)
++	elseif isStick(input) then
++		-- Controller (batch 1): either stick aims; walking is off at the lamp. The Keeper camera looks
++		-- toward -Z, so stick right = world +X and stick up = world -Z (same angle rule as aimAt).
++		local x, y = input.Position.X, input.Position.Y
++		if math.sqrt(x * x + y * y) >= STICK_DEADZONE then
++			pendingAngle = math.deg(math.atan2(-x, y))
++			lastAim = pendingAngle
++			stickHeld = true
++		else
++			stickHeld = false
++		end
+ 	end
+ end)
+ 
+@@ -187,23 +212,39 @@
+ 	if gameProcessed or not isKeeper then
+ 		return
+ 	end
++	local menuOpen = player:GetAttribute("MenuOpen") == true
+ 	if input.UserInputType == Enum.UserInputType.Touch then
++		heldTouches[input] = true
+ 		aimAt(input.Position)
+-	elseif input.KeyCode == Enum.KeyCode.Q then
++	elseif input.KeyCode == Enum.KeyCode.Q or (input.KeyCode == Enum.KeyCode.ButtonB and not menuOpen) then
+ 		lampAction:FireServer("leave")
+-	elseif input.KeyCode == Enum.KeyCode.F then
++	elseif input.KeyCode == Enum.KeyCode.F or (input.KeyCode == Enum.KeyCode.ButtonY and not menuOpen) then
+ 		lampAction:FireServer("toggleMode")
+ 	end
+ end)
+ 
++UserInputService.InputEnded:Connect(function(input)
++	heldTouches[input] = nil
++	if isStick(input) then
++		stickHeld = false
++	end
++end)
++
+ -- (the on-screen Focus / Leave buttons are drawn by Hud)
+ 
+--- Send aim updates to the server at most 20 times per second
++-- Send aim updates to the server at most 20 times per second. While a finger or stick is held still,
++-- re-send the same aim once a second so the 25 s idle release (KEEPER_IDLE_SECONDS) does not fire (GP-3).
+ RunService.RenderStepped:Connect(function()
+-	if isKeeper and pendingAngle and os.clock() - lastSent >= SEND_INTERVAL then
++	if not isKeeper then
++		return
++	end
++	if pendingAngle and os.clock() - lastSent >= SEND_INTERVAL then
+ 		beamControl:FireServer(pendingAngle)
+ 		pendingAngle = nil
+ 		lastSent = os.clock()
++	elseif lastAim and (stickHeld or next(heldTouches) ~= nil) and os.clock() - lastSent >= HOLD_RESEND then
++		beamControl:FireServer(lastAim)
++		lastSent = os.clock()
+ 	end
+ end)
+ 
+--- before/StarterPlayer_StarterPlayerScripts_Client_UiKit.luau
++++ after/StarterPlayer_StarterPlayerScripts_Client_UiKit.luau
+@@ -312,7 +312,10 @@
+ 	local anyOpen = next(openModals) ~= nil
+ 	Players.LocalPlayer:SetAttribute("MenuOpen", anyOpen)
+ 	pcall(function()
+-		GuiService.TouchControlsEnabled = not anyOpen
++		-- batch 1 (GP-43): closing a menu must not bring the joystick back while this player is the Keeper
++		local gameState = game:GetService("ReplicatedStorage"):FindFirstChild("GameState")
++		local isKeeper = gameState ~= nil and gameState:GetAttribute("KeeperUserId") == Players.LocalPlayer.UserId
++		GuiService.TouchControlsEnabled = not anyOpen and not isKeeper
+ 	end)
+ end
+ function UiKit.pushModal(name)

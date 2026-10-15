@@ -1,0 +1,11 @@
+# Lighthouse Keepers public repo: scripts and docs only (see docs/PROJECT_RULES_ADDENDUM.md)
+backups/
+work/
+vendor-review/
+*.rbxl
+*.rbxlx
+*.rbxm
+*.rbxmx
+.env
+*.cookie
+.claude/

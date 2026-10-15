@@ -1,0 +1,9 @@
+R5v3_mock_all_12.json was copied from the Studio output of the R5 v3 mock run (2026-10-14, about 20:45Z), all on in-memory fakes.
+
+To keep the file short:
+- RunIds are replaced by <RunId>.
+- The "ServerStorage.TestOnly_R5v2Staging." prefix is dropped from error locations.
+- Write lists that repeat the full scenario's pattern are given as writesCount. That count includes the fake ____PS probe writes, which do not happen in live servers.
+- Short annotations in parentheses name the transform behind a run-record write.
+
+All other values are verbatim.

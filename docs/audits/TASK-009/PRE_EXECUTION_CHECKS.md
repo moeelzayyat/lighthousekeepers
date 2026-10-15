@@ -1,0 +1,12 @@
+# R2 pre-execution checks (auditor's six conditions), 2026-10-14 — before any R2 write
+
+| # | Condition | Evidence |
+|---|---|---|
+| 1 | SHA-256 of `R2SaveLoad.luau`, `SaveTestGuard.luau`, `R2_run_command.luau`, pinned ProfileStore | Local files: `R2SaveLoad.luau` `8a1cac7a40ff371653278d08957fd48e35b17a4fa9937976925a0aed0ac30a25` (11,374 B); `SaveTestGuard.luau` `9e74c577f6d9b79bf784ee0c21917f488a392b1c50ad7d24c010576cf0278fab` (3,980 B); `R2_run_command.luau` `42d054965240c38067547ed2ca6fee4c7b2ae51944a9201742ee33ec07f22ae7` (1,447 B); `R2_status_command.luau` `99cf5a608962010d7746b4f4a06883a50c5bc9afede63fbd46b8b6e4ef6942e6`; pinned vendor `ad43737203688b8e88cab34ebe8c483000c157e53bfb41e35f1b49ee89d0c95f`. **Installed in SaveTest (computed inside Studio):** ProfileStore, guard and entrypoint hashes identical to the above. The run command itself re-checks all three installed hashes and aborts on any mismatch. |
+| 2 | Only one R2 execution at a time | Three independent locks: (a) the run command aborts unless the approval flag is false, and the flag stays true for the whole asynchronous run, so a second command during a run aborts; (b) `startReal` refuses while its status is "running"; (c) the test's first step aborts without writing if `player_900000201` already exists, so any second run after a completed one writes nothing. |
+| 3 | No automatic rerun after an MCP timeout | `startReal` returns immediately and the test continues inside Studio, so the run command itself is short. Claude sends the run command **once** and never re-sends it; if that call times out, Claude only reads status with the read-only status command and reports. Locks (a)-(c) also prevent a duplicate even if a command were repeated. |
+| 4 | Synthetic key absent | Read-only `GetAsync` on `TEST_LK_ProfileStore_v2` / `player_900000201` in SaveTest returned nil (`keyAbsent: true`). |
+| 5 | Both exact SaveTest IDs before any DataStore operation | The check above asserted PlaceId 128620546156998 and GameId 10770892134 (and rejected production IDs) before its single read; the run command, the guard and the entrypoint each assert them again. |
+| 6 | Complete source copies preserved | `docs/audits/TASK-009/luau/` holds the entrypoint, guard, run command and status command in full; they will be included verbatim in the package. |
+
+Current state: R2 approval flag `false`; real-module flag `false`; entrypoint status `mock-done` (from the dry run); the real ProfileStore is cached in this Studio session since R1.

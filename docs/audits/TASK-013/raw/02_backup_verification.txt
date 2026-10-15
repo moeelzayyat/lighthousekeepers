@@ -1,0 +1,2 @@
+SaveTest_TASK-013_pre.rbxl: 854,929 bytes, header <roblox!, SHA-256 9D8D3D16D9A49B36CB6238A599BFD3AAD36856D68E053B932FA6AC0C8A7423A9
+Rojo 7.7.1 syncback (work\savetest-pre013-export): guard 2ac3de3d..., R5CrossServer ab17dfee..., bootstrap 646ac454... (Disabled: true, no attributes), ProfileStore ad437372..., R4ShutdownRunner 1a125835...; ServerScriptService.Server.Main Disabled: true
