@@ -102,7 +102,10 @@ function ShipDeparture.rematch(shipId)
 	end
 end
 
+-- Revalidates before answering: an automatic departure below 4/4, a SAIL NOW whose caller left, or an empty
+-- party is cancelled here, so GameState never launches on a request that is no longer valid.
 function ShipDeparture.requested(shipId)
+	ShipDeparture.evaluate(shipId)
 	return requests[shipId] ~= nil
 end
 

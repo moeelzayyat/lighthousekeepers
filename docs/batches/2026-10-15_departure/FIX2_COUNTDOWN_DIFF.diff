@@ -1,0 +1,46 @@
+diff --git a/src/ServerScriptService/Server/GameState.luau b/src/ServerScriptService/Server/GameState.luau
+index 144fe74..0f30bf7 100644
+--- a/src/ServerScriptService/Server/GameState.luau
++++ b/src/ServerScriptService/Server/GameState.luau
+@@ -142,12 +142,13 @@ function GameState.run(deps)
+ 		while true do
+ 			local left = endsAt - os.clock()
+ 			state:SetAttribute("TimeLeft", math.max(0, math.ceil(left)))
+-			if left <= 0 then
+-				return true
+-			end
++			-- stop is checked BEFORE completion, so a cancel during the last wait is never reported as done
+ 			if shouldStop and shouldStop() then
+ 				return false
+ 			end
++			if left <= 0 then
++				return true
++			end
+ 			task.wait(0.2)
+ 		end
+ 	end
+@@ -349,7 +350,8 @@ function GameState.run(deps)
+ 		-- Departure revision: the countdown is cancelled when the request is withdrawn (4/4 dropped to 3, the
+ 		-- SAIL NOW player left, the party emptied), and an empty snapshot never starts a voyage.
+ 		local departing = {}
+-		if countdown(Config.INTERMISSION_SECONDS, departureCancelled) then
++		-- the request is revalidated once more right before the party is frozen (no yield in between)
++		if countdown(Config.INTERMISSION_SECONDS, departureCancelled) and departureRequested() then
+ 			departing = if deps.departShip then deps.departShip() else readyPlayers()
+ 		end
+ 		if #departing > 0 then
+diff --git a/src/ServerScriptService/Server/ShipDeparture.luau b/src/ServerScriptService/Server/ShipDeparture.luau
+index 566c1e8..bafd530 100644
+--- a/src/ServerScriptService/Server/ShipDeparture.luau
++++ b/src/ServerScriptService/Server/ShipDeparture.luau
+@@ -102,7 +102,10 @@ function ShipDeparture.rematch(shipId)
+ 	end
+ end
+ 
++-- Revalidates before answering: an automatic departure below 4/4, a SAIL NOW whose caller left, or an empty
++-- party is cancelled here, so GameState never launches on a request that is no longer valid.
+ function ShipDeparture.requested(shipId)
++	ShipDeparture.evaluate(shipId)
+ 	return requests[shipId] ~= nil
+ end
+ 
