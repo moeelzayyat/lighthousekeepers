@@ -22,6 +22,7 @@ local EventLog = require(script.Parent.EventLog)
 local PlayerData = require(script.Parent.PlayerData)
 local ShopService = require(script.Parent.ShopService)
 local LoadoutService = require(script.Parent.LoadoutService)
+local ShipRoster = require(script.Parent.ShipRoster)
 
 -- Shared state the HUD reads (attributes replicate to every client automatically)
 local stateFolder = Instance.new("Folder")
@@ -642,54 +643,46 @@ remotes.SetReady.OnServerEvent:Connect(function(player, ready)
 	end
 end)
 
--- Crew cap (batch 1): at most Config.MAX_CREW players sail; anyone else waits on the ship
-local function crewIsFull(player)
-	local n = 0
-	for _, p in Players:GetPlayers() do
-		if p ~= player and p:GetAttribute("Ready") then
-			n += 1
-		end
-	end
-	return n >= (Config.MAX_CREW or 4)
-end
+-- Ship parties (batch 1 revision): the lobby holds the whole server; each departure ship takes a party of at
+-- most Config.MAX_CREW. ShipRoster is the only thing that puts a player in a crew (Ready = true).
+local SHIP_ID = "Ship1" -- the existing pirate ship
+ShipRoster.init(stateFolder, Config.MAX_CREW or 4, { SHIP_ID })
 
--- Joining the crew (ship's wheel, or automatically on a first voyage). Returns false if the crew is full.
+-- Joining a ship's party at its wheel. Returns false if the party is full or the ship has sailed.
 local function joinCrew(player, via)
-	local phase = stateFolder:GetAttribute("Phase")
-	if crewIsFull(player) then
-		LampService.notify(player, string.format("The crew is full (%d Keepers). Wait on the ship: you can join the next voyage.", Config.MAX_CREW or 4))
-		EventLog.log("CrewFull", { player = player.Name, via = via })
+	local ok, reason = ShipRoster.join(player, SHIP_ID)
+	if not ok then
+		LampService.notify(player, if reason == "full"
+			then string.format("This ship's crew is full (%d of %d). Wait on deck: you can join the next voyage.", ShipRoster.CAPACITY, ShipRoster.CAPACITY)
+			else "The ship has sailed with its crew. Wait on deck for the next voyage.")
+		EventLog.log("CrewRefused", { player = player.Name, via = via, reason = reason, ship = SHIP_ID })
 		return false
 	end
-	player:SetAttribute("Ready", true)
-	EventLog.log("PlayerReady", { player = player.Name, via = via })
-	EventLog.mark(player, "crew")
-	if RUN_PHASES[phase] then
-		LampService.notify(player, "You joined the crew mid-voyage! Rowing you to the island...")
-		sendToIsland(player)
-	else
-		LampService.notify(player, if via == "first voyage" then "The storm is coming. The light needs a keeper: the ship sets sail soon." else "You joined the crew! The ship sets sail soon.")
+	if reason == "joined" then
+		EventLog.log("PlayerReady", { player = player.Name, via = via, ship = SHIP_ID })
+		EventLog.mark(player, "crew")
+		LampService.notify(player, "You joined the crew! The ship sets sail soon.")
 	end
 	return true
 end
 
--- The ship's wheel: join or leave the crew
+-- The ship's wheel: join or leave this ship's party
 lobbyRefs.helmPrompt.Triggered:Connect(function(player)
 	if not player:GetAttribute("InLobby") then
 		return
 	end
-	local phase = stateFolder:GetAttribute("Phase")
-	if player:GetAttribute("Ready") then
-		player:SetAttribute("Ready", false)
+	if ShipRoster.shipOf(player) == SHIP_ID then
+		ShipRoster.leave(player, "wheel")
 		LampService.notify(player, "You left the crew. Use the wheel again to rejoin.")
-		EventLog.log("LeftCrew", { player = player.Name })
+		EventLog.log("LeftCrew", { player = player.Name, ship = SHIP_ID })
 	else
 		joinCrew(player, "wheel")
 	end
 end)
 
 -- First-voyage route (launch R2). A player whose profile loaded cleanly with 0 completed runs skips
--- the title and joins the crew at once (mid-voyage if a run is underway). Everyone else gets the
+-- the title and lands on the ship's deck, where the wheel signs them up (batch 1 revision: they are no
+-- longer put in a crew automatically). Everyone else gets the
 -- title. A failed or slow profile load ALWAYS gets the title: never guess someone is new.
 -- The client waits for the Route attribute before showing anything.
 local function chooseRoute(player)
@@ -705,7 +698,6 @@ local function chooseRoute(player)
 		and (profileState == "saved" or profileState == "memory")
 		and player:GetAttribute("RunsCompleted") == 0
 		and not player:GetAttribute("InLobby")
-		and not crewIsFull(player) -- batch 1: a full crew sends a first-timer to the title instead
 	EventLog.setRoute(player, if fast then "fast" elseif profileState == "failed" then "failed-load" elseif profileState == nil then "slow-load" else "title")
 	if not fast then
 		player:SetAttribute("Route", "title")
@@ -723,7 +715,7 @@ local function chooseRoute(player)
 	EventLog.log("EnteredLobby", { player = player.Name, via = "first voyage" })
 	task.wait(0.4)
 	if player.Parent == Players and not player:GetAttribute("Ready") then
-		joinCrew(player, "first voyage")
+		LampService.notify(player, "The storm is coming and the light needs keepers. Use the SHIP'S WHEEL to join the crew.")
 	end
 end
 Players.PlayerAdded:Connect(function(player)
@@ -880,6 +872,9 @@ GameState.run({
 	state = stateFolder,
 	remotes = remotes,
 	resetRound = resetRound,
+	departShip = function()
+		return ShipRoster.depart(SHIP_ID) -- freezes the party; only these players sail
+	end,
 	lampVisuals = LampService.refreshVisuals,
 	autoSell = autoSellAtDawn,
 })

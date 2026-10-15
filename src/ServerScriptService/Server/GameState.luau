@@ -334,9 +334,11 @@ function GameState.run(deps)
 			end
 		end
 		if countdown(Config.INTERMISSION_SECONDS, noPlayers) then
+			-- Departure (batch 1 revision): the ship's party is frozen here and only those players sail
+			local departing = if deps.departShip then deps.departShip() else readyPlayers()
 			deps.resetRound()
-			local forecast, votesA, votesB = chooseForecast(readyPlayers())
-			EventLog.startRun(readyPlayers())
+			local forecast, votesA, votesB = chooseForecast(departing)
+			EventLog.startRun(departing)
 			if forecast then
 				EventLog.setForecast(forecast)
 				EventLog.log("Forecast", { id = forecast, votesA = votesA, votesB = votesB, a = state:GetAttribute("ForecastA"), b = state:GetAttribute("ForecastB") })
@@ -346,7 +348,7 @@ function GameState.run(deps)
 				task.delay(1.2, notifyAll, "Forecast: " .. Forecasts[forecast].displayName .. ". " .. Forecasts[forecast].summary)
 			end
 			-- The crew sails from the ship to the lighthouse island
-			for _, player in readyPlayers() do
+			for _, player in departing do
 				deps.sendToIsland(player)
 			end
 			task.wait(0.6)

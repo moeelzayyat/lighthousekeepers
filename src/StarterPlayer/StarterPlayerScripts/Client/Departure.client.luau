@@ -336,7 +336,7 @@ local function render()
 	local showCrew = ready and not underway and (sailing or phase == "Waiting") and not hidden
 	crewCard.Visible = showCrew
 	if showCrew then
-		crewEyebrow.Text = string.format("YOUR CREW · %d", crewCount)
+		crewEyebrow.Text = string.format("YOUR CREW · %d/%d", crewCount, state:GetAttribute("ShipCapacity") or 4) -- seats on this ship
 		crewHeadline.Text = if sailing then (if atHarbor then "Sailing in " else "Next storm in ") .. clock(left) else "Waiting to sail"
 		crewHeadline.TextColor3 = if sailing and left <= 5 then C.AccentLighthouseSoft else C.TextPrimary
 		for i, row in rosterRows do
