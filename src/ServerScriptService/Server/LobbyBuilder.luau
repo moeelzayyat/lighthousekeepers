@@ -217,4 +217,67 @@ function LobbyBuilder.build(islandRefs)
 	}
 end
 
+-- Multi-ship phase 2 (harbor role only, behind Config.MULTI_SHIP_ENABLED): more departure ships moored beside
+-- the first. Each is a copy of the first ship with its OWN BoardingZone (the first ship's zone, moved with it),
+-- its own wheel prompt (SAIL NOW) and a gangway to the shore. Returns { [shipId] = { helmPrompt, boardingZone } }.
+local EXTRA_SHIPS = { { id = "Ship2", side = 48 } } -- side: studs along world X from the first ship
+
+function LobbyBuilder.buildExtraShips(lobbyRefs)
+	local lobby = lobbyRefs.folder
+	local first = lobby:FindFirstChild("PirateShip")
+	lobbyRefs.helmPrompt:SetAttribute("ShipId", "Ship1")
+	lobbyRefs.boardingZone:SetAttribute("ShipId", "Ship1")
+	local built = {}
+	for _, spec in EXTRA_SHIPS do
+		local shift = CFrame.new(spec.side, 0, 0)
+		local ship = first:Clone()
+		ship.Name = "PirateShip_" .. spec.id
+		for _, d in ship:GetDescendants() do
+			if d:IsA("ProximityPrompt") then
+				d:Destroy()
+			end
+		end
+		ship:PivotTo(shift * first:GetPivot())
+		ship.Parent = lobby
+
+		local zone = lobbyRefs.boardingZone:Clone()
+		zone.Name = "BoardingZone_" .. spec.id
+		zone.CFrame = shift * lobbyRefs.boardingZone.CFrame
+		zone:SetAttribute("ShipId", spec.id)
+		zone.Parent = lobby
+
+		-- the wheel: the copy's own wheel, or a simple post at the stern if the ship has none
+		local wheel = ship:FindFirstChild("WheelStand", true) or ship:FindFirstChild("WheelHub", true)
+		if not wheel then
+			local post = lobbyRefs.helmPrompt.Parent
+			wheel = makePart("WheelPost_" .. spec.id, post.Size, shift * post.CFrame, post.Color, post.Material, lobby)
+		end
+		local prompt = lobbyRefs.helmPrompt:Clone()
+		prompt.Enabled = true
+		prompt:SetAttribute("ShipId", spec.id)
+		prompt.Parent = wheel
+
+		-- gangway from the stern down to the shore
+		local deckTop = -math.huge
+		for _, part in ship:GetDescendants() do
+			if part:IsA("BasePart") and (part.Name:find("Floor") or part.Name == "Deck") then
+				deckTop = math.max(deckTop, part.Position.Y + part.Size.Y / 2)
+			end
+		end
+		if deckTop == -math.huge then
+			deckTop = zone.Position.Y - zone.Size.Y / 2 + 1
+		end
+		local sternZ = zone.Position.Z + zone.Size.Z / 2
+		local x = zone.Position.X
+		local fromPos = Vector3.new(x, deckTop, sternZ - 2)
+		local shoreZ = sternZ + 24
+		local toPos = Vector3.new(x, Ground.heightAt(x, shoreZ) + 0.5, shoreZ)
+		local length = (toPos - fromPos).Magnitude
+		makePart("Gangway_" .. spec.id, Vector3.new(7, 1, length), CFrame.lookAt((fromPos + toPos) / 2, toPos), Color3.fromRGB(120, 85, 55), Enum.Material.WoodPlanks, lobby)
+
+		built[spec.id] = { helmPrompt = prompt, boardingZone = zone, ship = ship }
+	end
+	return built
+end
+
 return LobbyBuilder

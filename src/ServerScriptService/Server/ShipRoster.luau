@@ -79,6 +79,16 @@ function ShipRoster.init(stateFolder, capacity, shipIds)
 	end)
 end
 
+-- Multi-ship harbor (phase 2): a ship takes a new party as soon as its crew has left, without waiting for a
+-- global game phase (the harbor has none). Unused in the single-server game, which unlocks on Phase.
+function ShipRoster.unlock(shipId)
+	local ship = ships[shipId]
+	if ship and ship.locked then
+		ship.locked = false
+		publish(ship)
+	end
+end
+
 function ShipRoster.isLocked(shipId)
 	local ship = ships[shipId]
 	return ship ~= nil and ship.locked

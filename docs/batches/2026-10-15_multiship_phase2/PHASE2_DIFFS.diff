@@ -1,0 +1,1009 @@
+diff --git a/src/ReplicatedStorage/Shared/Config.luau b/src/ReplicatedStorage/Shared/Config.luau
+index 63fb954..e734e69 100644
+--- a/src/ReplicatedStorage/Shared/Config.luau
++++ b/src/ReplicatedStorage/Shared/Config.luau
+@@ -47,6 +47,15 @@ local Config = {
+ 	FUEL_PER_REFILL = 40, -- one barrel of oil
+ 	FUEL_DRAIN_BY_CREW_SIZE = { 0.7, 0.85, 1, 1 }, -- drain multiplier for 1, 2, 3, 4 players (solo can't refuel and keep the lamp at once)
+ 	MAX_CREW = 4, -- party size of ONE departure ship (batch 1 revision); the lobby itself holds the whole server
++
++	-- Multi-ship (phase 2 foundation). ALL OFF in the published game: with MULTI_SHIP_ENABLED = false the
++	-- place runs exactly as before (one ship, the voyage in this same server).
++	MULTI_SHIP_ENABLED = false, -- harbor/isle place roles and a second departure ship
++	TELEPORT_ENABLED = false, -- send crews to reserved Lighthouse Isle servers (needs the Isle place; owner-only)
++	PLACE_ROLE_OVERRIDE = nil, -- Studio testing only: "harbor" or "isle" (nil = decided by PlaceId)
++	HARBOR_PLACE_ID = 132065051336560, -- the Lighthouse Keepers start place
++	ISLE_PLACE_ID = 0, -- the Lighthouse Isle place, once the owner creates it (0 = not created)
++	ISLE_ARRIVAL_WAIT = 20, -- isle: seconds to wait for the whole crew before the voyage starts anyway
+ 	DAWN_LOOT_SECONDS = 25, -- leftover loot stays this long into the day at full value (was 10; owner, Oct 12)
+ 	DAWN_LOOT_FRACTION = 0.5, -- at dawn the tide brings leftover loot to the crew at this fraction of its value
+ 	DARK_GRACE_SECONDS = 10, -- how long the lamp can be out before the run is lost
+diff --git a/src/ServerScriptService/Server/LobbyBuilder.luau b/src/ServerScriptService/Server/LobbyBuilder.luau
+index f258c4b..5ef26c8 100644
+--- a/src/ServerScriptService/Server/LobbyBuilder.luau
++++ b/src/ServerScriptService/Server/LobbyBuilder.luau
+@@ -217,4 +217,67 @@ function LobbyBuilder.build(islandRefs)
+ 	}
+ end
+ 
++-- Multi-ship phase 2 (harbor role only, behind Config.MULTI_SHIP_ENABLED): more departure ships moored beside
++-- the first. Each is a copy of the first ship with its OWN BoardingZone (the first ship's zone, moved with it),
++-- its own wheel prompt (SAIL NOW) and a gangway to the shore. Returns { [shipId] = { helmPrompt, boardingZone } }.
++local EXTRA_SHIPS = { { id = "Ship2", side = 48 } } -- side: studs along world X from the first ship
++
++function LobbyBuilder.buildExtraShips(lobbyRefs)
++	local lobby = lobbyRefs.folder
++	local first = lobby:FindFirstChild("PirateShip")
++	lobbyRefs.helmPrompt:SetAttribute("ShipId", "Ship1")
++	lobbyRefs.boardingZone:SetAttribute("ShipId", "Ship1")
++	local built = {}
++	for _, spec in EXTRA_SHIPS do
++		local shift = CFrame.new(spec.side, 0, 0)
++		local ship = first:Clone()
++		ship.Name = "PirateShip_" .. spec.id
++		for _, d in ship:GetDescendants() do
++			if d:IsA("ProximityPrompt") then
++				d:Destroy()
++			end
++		end
++		ship:PivotTo(shift * first:GetPivot())
++		ship.Parent = lobby
++
++		local zone = lobbyRefs.boardingZone:Clone()
++		zone.Name = "BoardingZone_" .. spec.id
++		zone.CFrame = shift * lobbyRefs.boardingZone.CFrame
++		zone:SetAttribute("ShipId", spec.id)
++		zone.Parent = lobby
++
++		-- the wheel: the copy's own wheel, or a simple post at the stern if the ship has none
++		local wheel = ship:FindFirstChild("WheelStand", true) or ship:FindFirstChild("WheelHub", true)
++		if not wheel then
++			local post = lobbyRefs.helmPrompt.Parent
++			wheel = makePart("WheelPost_" .. spec.id, post.Size, shift * post.CFrame, post.Color, post.Material, lobby)
++		end
++		local prompt = lobbyRefs.helmPrompt:Clone()
++		prompt.Enabled = true
++		prompt:SetAttribute("ShipId", spec.id)
++		prompt.Parent = wheel
++
++		-- gangway from the stern down to the shore
++		local deckTop = -math.huge
++		for _, part in ship:GetDescendants() do
++			if part:IsA("BasePart") and (part.Name:find("Floor") or part.Name == "Deck") then
++				deckTop = math.max(deckTop, part.Position.Y + part.Size.Y / 2)
++			end
++		end
++		if deckTop == -math.huge then
++			deckTop = zone.Position.Y - zone.Size.Y / 2 + 1
++		end
++		local sternZ = zone.Position.Z + zone.Size.Z / 2
++		local x = zone.Position.X
++		local fromPos = Vector3.new(x, deckTop, sternZ - 2)
++		local shoreZ = sternZ + 24
++		local toPos = Vector3.new(x, Ground.heightAt(x, shoreZ) + 0.5, shoreZ)
++		local length = (toPos - fromPos).Magnitude
++		makePart("Gangway_" .. spec.id, Vector3.new(7, 1, length), CFrame.lookAt((fromPos + toPos) / 2, toPos), Color3.fromRGB(120, 85, 55), Enum.Material.WoodPlanks, lobby)
++
++		built[spec.id] = { helmPrompt = prompt, boardingZone = zone, ship = ship }
++	end
++	return built
++end
++
+ return LobbyBuilder
+diff --git a/src/ServerScriptService/Server/Main.server.luau b/src/ServerScriptService/Server/Main.server.luau
+index 2a7cea8..84d74e2 100644
+--- a/src/ServerScriptService/Server/Main.server.luau
++++ b/src/ServerScriptService/Server/Main.server.luau
+@@ -26,6 +26,13 @@ local ShipRoster = require(script.Parent.ShipRoster)
+ local ShipBoarding = require(script.Parent.ShipBoarding)
+ local ShipDeparture = require(script.Parent.ShipDeparture)
+ local VoyageCast = require(script.Parent.VoyageCast)
++local PlaceRole = require(script.Parent.PlaceRole)
++local HarborDepartures = require(script.Parent.HarborDepartures)
++local Voyages = require(script.Parent.Voyages)
++local IsleAdmission = require(script.Parent.IsleAdmission)
++
++-- Multi-ship phase 2: "single" (MULTI_SHIP_ENABLED off, the published game, unchanged), "harbor" or "isle"
++local ROLE = PlaceRole.get()
+ 
+ -- Shared state the HUD reads (attributes replicate to every client automatically)
+ local stateFolder = Instance.new("Folder")
+@@ -56,6 +63,8 @@ remotes.Parent = ReplicatedStorage
+ 
+ local refs = IslandBuilder.build()
+ local lobbyRefs = LobbyBuilder.build(refs) -- the pirate-ship lobby (also moves the Quartermaster aboard)
++-- harbor role: more departure ships, each with its own BoardingZone and wheel ({ [shipId] = refs })
++local extraShips = if ROLE == "harbor" then LobbyBuilder.buildExtraShips(lobbyRefs) else {}
+ LampService.init(refs, stateFolder, remotes)
+ TowerService.init(stateFolder, refs.repairPrompt, LampService.notify)
+ PlayerData.init(remotes, LampService.notify)
+@@ -598,6 +607,9 @@ local function sendToShip(player)
+ 	if LampService.getKeeper() == player then
+ 		LampService.setKeeper(nil, "leave")
+ 	end
++	if ROLE == "isle" and Voyages.returnToHarbor(player) then
++		return -- isle: leaving the crew means sailing back to the harbor place
++	end
+ 	task.spawn(moveCharacterTo, player, lobbyRefs.spawn.CFrame)
+ end
+ 
+@@ -649,14 +661,30 @@ end)
+ -- Ship parties (batch 1 revision): the lobby holds the whole server; each departure ship takes a party of at
+ -- most Config.MAX_CREW. ShipRoster is the only thing that puts a player in a crew (Ready = true).
+ local SHIP_ID = "Ship1" -- the existing pirate ship
+-ShipRoster.init(stateFolder, Config.MAX_CREW or 4, { SHIP_ID })
++-- multi-ship phase 2: the harbor has more ships; each has its own roster, BoardingZone, wheel and countdown
++local SHIP_IDS = { SHIP_ID }
++local shipZones = { [SHIP_ID] = lobbyRefs.boardingZone }
++local shipPrompts = { [SHIP_ID] = lobbyRefs.helmPrompt }
++for shipId, ship in extraShips do
++	table.insert(SHIP_IDS, shipId)
++	shipZones[shipId] = ship.boardingZone
++	shipPrompts[shipId] = ship.helmPrompt
++end
++table.sort(SHIP_IDS)
++ShipRoster.init(stateFolder, Config.MAX_CREW or 4, SHIP_IDS)
++stateFolder:SetAttribute("MultiShip", ROLE == "harbor")
+ 
+ -- Boarding batch: standing in the ship's BoardingZone joins its party (no button).
+ -- Departure revision: boarding never starts a departure. ShipDeparture does: automatically at 4/4, or when a
+ -- crew member of a party of 1 to 3 uses SAIL NOW at the ship's wheel.
++if ROLE == "isle" then
++	-- isle: the crew comes from the voyage manifest, not from boarding a ship
++	lobbyRefs.helmPrompt.Enabled = false
++	shipZones = {}
++end
+ ShipBoarding.init({
+ 	roster = ShipRoster,
+-	zones = { [SHIP_ID] = lobbyRefs.boardingZone },
++	zones = shipZones,
+ 	notify = LampService.notify,
+ 	log = EventLog.log,
+ 	mark = EventLog.mark,
+@@ -667,7 +695,7 @@ ShipBoarding.init({
+ ShipDeparture.init({
+ 	roster = ShipRoster,
+ 	state = stateFolder,
+-	shipIds = { SHIP_ID },
++	shipIds = if ROLE == "isle" then {} else SHIP_IDS,
+ 	notify = LampService.notify,
+ 	log = EventLog.log,
+ })
+@@ -680,16 +708,18 @@ local SAIL_REFUSED = {
+ 	already = "The ship is already preparing to sail.",
+ 	full = "The crew is full: the ship sails automatically.",
+ }
+-lobbyRefs.helmPrompt.Triggered:Connect(function(player)
+-	if not player:GetAttribute("InLobby") then
+-		return
+-	end
+-	local ok, reason = ShipDeparture.sailNow(player, SHIP_ID)
+-	if not ok then
+-		LampService.notify(player, SAIL_REFUSED[reason] or "You can't sail right now.")
+-		EventLog.log("SailNowRefused", { player = player.Name, reason = reason, ship = SHIP_ID })
+-	end
+-end)
++for shipId, prompt in shipPrompts do
++	prompt.Triggered:Connect(function(player)
++		if ROLE == "isle" or not player:GetAttribute("InLobby") then
++			return
++		end
++		local ok, reason = ShipDeparture.sailNow(player, shipId)
++		if not ok then
++			LampService.notify(player, SAIL_REFUSED[reason] or "You can't sail right now.")
++			EventLog.log("SailNowRefused", { player = player.Name, reason = reason, ship = shipId })
++		end
++	end)
++end
+ 
+ -- First-voyage route (launch R2). A player whose profile loaded cleanly with 0 completed runs skips
+ -- the title and lands on the ship's deck, where the wheel signs them up (batch 1 revision: they are no
+@@ -705,10 +735,11 @@ local function chooseRoute(player)
+ 		return
+ 	end
+ 	local profileState = player:GetAttribute("ProfileState")
+-	local fast = Config.FIRST_VOYAGE_FAST_PATH == true
+-		and (profileState == "saved" or profileState == "memory")
+-		and player:GetAttribute("RunsCompleted") == 0
+-		and not player:GetAttribute("InLobby")
++	local fast = ROLE == "isle" -- isle: the crew arrives straight from the harbor, no title screen
++		or (Config.FIRST_VOYAGE_FAST_PATH == true
++			and (profileState == "saved" or profileState == "memory")
++			and player:GetAttribute("RunsCompleted") == 0
++			and not player:GetAttribute("InLobby"))
+ 	EventLog.setRoute(player, if fast then "fast" elseif profileState == "failed" then "failed-load" elseif profileState == nil then "slow-load" else "title")
+ 	if not fast then
+ 		player:SetAttribute("Route", "title")
+@@ -725,7 +756,7 @@ local function chooseRoute(player)
+ 	player:SetAttribute("InLobby", true)
+ 	EventLog.log("EnteredLobby", { player = player.Name, via = "first voyage" })
+ 	task.wait(0.4)
+-	if player.Parent == Players and not player:GetAttribute("Ready") then
++	if ROLE ~= "isle" and player.Parent == Players and not player:GetAttribute("Ready") then
+ 		LampService.notify(player, "The storm is coming and the light needs keepers. Walk onto the ship to join the crew.")
+ 	end
+ end
+@@ -871,6 +902,42 @@ local function resetRound()
+ 	end
+ end
+ 
++-- Multi-ship phase 2 wiring. "single" (the published game) skips all of this and runs GameState as before.
++Voyages.init({
++	notify = LampService.notify,
++	log = EventLog.log,
++	roster = ShipRoster,
++	playerData = nil, -- the save hand-off adapter (SessionLock) is NOT wired: Voyages refuses to teleport without it
++	sendToHarbor = function(player)
++		task.spawn(moveCharacterTo, player, lobbyRefs.spawn.CFrame)
++	end,
++})
++if ROLE == "harbor" then
++	-- the harbor never runs the voyage loop: each ship counts down on its own and its crew leaves the server
++	HarborDepartures.start({
++		roster = ShipRoster,
++		departure = ShipDeparture,
++		boarding = ShipBoarding,
++		state = stateFolder,
++		shipIds = SHIP_IDS,
++		seconds = Config.INTERMISSION_SECONDS,
++		launch = Voyages.launch,
++		log = EventLog.log,
++	})
++	return
++end
++if ROLE == "isle" then
++	IsleAdmission.init({
++		manifest = Voyages.readManifest(),
++		log = EventLog.log,
++		sendToHarbor = function(player)
++			if not Voyages.returnToHarbor(player) then
++				player:Kick("This Lighthouse Isle voyage belongs to another crew.")
++			end
++		end,
++	})
++end
++
+ GameState.run({
+ 	lamp = LampService,
+ 	tower = TowerService,
+@@ -883,7 +950,7 @@ GameState.run({
+ 	state = stateFolder,
+ 	remotes = remotes,
+ 	resetRound = resetRound,
+-	departure = {
++	departure = if ROLE == "isle" then IsleAdmission else {
+ 		requested = function()
+ 			return ShipDeparture.requested(SHIP_ID)
+ 		end,
+@@ -891,7 +958,7 @@ GameState.run({
+ 			ShipDeparture.rematch(SHIP_ID)
+ 		end,
+ 	},
+-	departShip = function()
++	departShip = if ROLE == "isle" then IsleAdmission.depart else function()
+ 		local sailing = ShipRoster.depart(SHIP_ID) -- freezes the party; only these players sail
+ 		ShipBoarding.departed(sailing) -- their seats no longer depend on standing on the deck
+ 		ShipDeparture.departed(SHIP_ID) -- the departure request is used up
+diff --git a/src/ServerScriptService/Server/ShipRoster.luau b/src/ServerScriptService/Server/ShipRoster.luau
+index 4aa3caf..ec19604 100644
+--- a/src/ServerScriptService/Server/ShipRoster.luau
++++ b/src/ServerScriptService/Server/ShipRoster.luau
+@@ -79,6 +79,16 @@ function ShipRoster.init(stateFolder, capacity, shipIds)
+ 	end)
+ end
+ 
++-- Multi-ship harbor (phase 2): a ship takes a new party as soon as its crew has left, without waiting for a
++-- global game phase (the harbor has none). Unused in the single-server game, which unlocks on Phase.
++function ShipRoster.unlock(shipId)
++	local ship = ships[shipId]
++	if ship and ship.locked then
++		ship.locked = false
++		publish(ship)
++	end
++end
++
+ function ShipRoster.isLocked(shipId)
+ 	local ship = ships[shipId]
+ 	return ship ~= nil and ship.locked
+diff --git a/src/StarterPlayer/StarterPlayerScripts/Client/Departure.client.luau b/src/StarterPlayer/StarterPlayerScripts/Client/Departure.client.luau
+index 37ae599..81a34fb 100644
+--- a/src/StarterPlayer/StarterPlayerScripts/Client/Departure.client.luau
++++ b/src/StarterPlayer/StarterPlayerScripts/Client/Departure.client.luau
+@@ -239,15 +239,11 @@ local travelTexts = { travelTitle, travelSub }
+ -- THE SHIP'S WHEEL (world sign + your prompt text)
+ ---------------------------------------------------------------------
+ 
+-local wheelSign, signState, signDetail, helmPrompt
++-- one sign per ship's wheel (multi-ship phase 2: the harbor can have several ships; prompt attribute ShipId)
++local wheels = {} -- { { prompt, shipId, sign, state, detail } }
+ 
+-local function bindWheel()
+-	local lobby = lobbyFolder()
+-	helmPrompt = lobby and lobby:FindFirstChild("HelmPrompt", true)
+-	if not helmPrompt or wheelSign then
+-		return
+-	end
+-	wheelSign = UiKit.new("BillboardGui", {
++local function makeSign(helmPrompt)
++	local wheelSign = UiKit.new("BillboardGui", {
+ 		Name = "WheelSign",
+ 		Adornee = helmPrompt.Parent,
+ 		Size = UDim2.fromOffset(240, 62),
+@@ -261,7 +257,7 @@ local function bindWheel()
+ 	UiKit.round(plate, UiKit.Radius.card)
+ 	UiKit.border(plate, C.BorderBrassBright, 1.5, 0.15)
+ 	UiKit.Brackets(plate, C.AccentLighthouse, 8, 2, 0)
+-	signState = UiKit.new("TextLabel", {
++	local signState = UiKit.new("TextLabel", {
+ 		Name = "State",
+ 		BackgroundTransparency = 1,
+ 		FontFace = F.LabelBold,
+@@ -270,7 +266,7 @@ local function bindWheel()
+ 		Position = UDim2.fromOffset(0, 6),
+ 		Size = UDim2.new(1, 0, 0, 26),
+ 	}, plate)
+-	signDetail = UiKit.new("TextLabel", {
++	local signDetail = UiKit.new("TextLabel", {
+ 		Name = "Detail",
+ 		BackgroundTransparency = 1,
+ 		FontFace = F.BodyMedium,
+@@ -279,6 +275,27 @@ local function bindWheel()
+ 		Position = UDim2.fromOffset(0, 32),
+ 		Size = UDim2.new(1, 0, 0, 22),
+ 	}, plate)
++	table.insert(wheels, { prompt = helmPrompt, shipId = helmPrompt:GetAttribute("ShipId") or "Ship1", sign = wheelSign, state = signState, detail = signDetail })
++end
++
++local function bindWheel()
++	local lobby = lobbyFolder()
++	if not lobby then
++		return
++	end
++	for _, d in lobby:GetDescendants() do
++		if d:IsA("ProximityPrompt") and d.Name == "HelmPrompt" then
++			local known = false
++			for _, w in wheels do
++				if w.prompt == d then
++					known = true
++				end
++			end
++			if not known then
++				makeSign(d)
++			end
++		end
++	end
+ end
+ 
+ ---------------------------------------------------------------------
+@@ -343,38 +360,58 @@ local function render()
+ 	local underway = RUN_PHASES[phase] == true
+ 	local key = inputKey()
+ 
+-	-- the wheel sign: everyone nearby reads the same departure state
++	-- the wheel signs: everyone nearby reads the same departure state
+ 	local capacity = state:GetAttribute("ShipCapacity") or 4
++	local multi = state:GetAttribute("MultiShip") == true -- harbor with several ships, each with its own countdown
++	local shipId = shownShip()
++	-- one ship's departure state. Single-server game: the global Phase/TimeLeft; harbor: that ship's own countdown
++	local function shipView(id)
++		local count = if id == shipId then crewCount else (state:GetAttribute("Ship_" .. id .. "_Count") or 0)
++		local view = { count = count, departure = state:GetAttribute("Ship_" .. id .. "_Departure") }
++		if multi then
++			local shipPhase = state:GetAttribute("Ship_" .. id .. "_Phase") or "Waiting"
++			view.sailing = shipPhase == "Countdown"
++			view.left = state:GetAttribute("Ship_" .. id .. "_TimeLeft") or 0
++			view.underway = shipPhase == "Sailing"
++			view.inPort = shipPhase == "Waiting"
++		else
++			view.sailing, view.left, view.underway, view.inPort = sailing, left, underway, phase == "Waiting"
++		end
++		return view
++	end
++	local mine = shipView(shipId)
++	if multi then
++		sailing, left, underway = mine.sailing, mine.left, mine.underway
++	end
+ 	local seats = string.format("%d/%d", crewCount, capacity)
+ 	local full = crewCount >= capacity
+-	local shipId = shownShip()
+-	local departure = state:GetAttribute("Ship_" .. shipId .. "_Departure") -- "auto" | "manual" | "rematch" | nil
++	local departure = mine.departure -- "auto" | "manual" | "rematch" | nil
+ 	local leaving = sailing and departure ~= nil
+-	if wheelSign then
+-		if underway then
+-			signState.Text = "AT SEA"
+-			signDetail.Text = seats .. " crew · next voyage soon"
+-			signState.TextColor3 = C.AccentSea
+-		elseif leaving then
+-			signState.Text = "LEAVING IN " .. clock(left)
+-			signDetail.Text = if full then seats .. " crew · crew full" elseif departure == "manual" then seats .. " crew · SAIL NOW called" else seats .. " crew · walk aboard to join"
+-			signState.TextColor3 = if left <= 5 then C.StateWarning else C.AccentLighthouse
+-		elseif crewCount == 0 then
+-			signState.Text = "WAITING FOR CREW"
+-			signDetail.Text = "0/" .. capacity .. " · walk aboard to join"
+-			signState.TextColor3 = C.AccentLighthouse
++	for _, w in wheels do
++		local v = shipView(w.shipId)
++		local wSeats = string.format("%d/%d", v.count, capacity)
++		if v.underway then
++			w.state.Text = "AT SEA"
++			w.detail.Text = wSeats .. " crew · next voyage soon"
++			w.state.TextColor3 = C.AccentSea
++		elseif v.sailing and v.departure ~= nil then
++			w.state.Text = "LEAVING IN " .. clock(v.left)
++			w.detail.Text = if v.count >= capacity then wSeats .. " crew · crew full" elseif v.departure == "manual" then wSeats .. " crew · SAIL NOW called" else wSeats .. " crew · walk aboard to join"
++			w.state.TextColor3 = if v.left <= 5 then C.StateWarning else C.AccentLighthouse
++		elseif v.count == 0 then
++			w.state.Text = "WAITING FOR CREW"
++			w.detail.Text = "0/" .. capacity .. " · walk aboard to join"
++			w.state.TextColor3 = C.AccentLighthouse
+ 		else
+-			signState.Text = "CREW " .. seats
+-			signDetail.Text = "Waiting for crew · SAIL NOW at the wheel"
+-			signState.TextColor3 = C.AccentLighthouse
++			w.state.Text = "CREW " .. wSeats
++			w.detail.Text = "Waiting for crew · SAIL NOW at the wheel"
++			w.state.TextColor3 = C.AccentLighthouse
+ 		end
+-	end
+-	-- SAIL NOW: only a member of this ship's party of 1 to 3, in port, before any departure has started
+-	-- (local visibility only; the server checks every press)
+-	if helmPrompt then
+-		helmPrompt.Enabled = ready and player:GetAttribute("ShipId") == shipId and crewCount >= 1 and crewCount < capacity
+-			and departure == nil and phase == "Waiting"
+-		helmPrompt.ActionText = string.format("Sail now (%s)", seats)
++		-- SAIL NOW: only a member of this ship's party of 1 to 3, in port, before any departure has started
++		-- (local visibility only; the server checks every press)
++		w.prompt.Enabled = ready and player:GetAttribute("ShipId") == w.shipId and v.count >= 1 and v.count < capacity
++			and v.departure == nil and v.inPort
++		w.prompt.ActionText = string.format("Sail now (%s)", wSeats)
+ 	end
+ 
+ 	local hidden = player:GetAttribute("MenuOpen") == true
+diff --git a/src/ServerScriptService/Server/PlaceRole.luau b/src/ServerScriptService/Server/PlaceRole.luau
+new file mode 100644
+index 0000000..d3d1bdf
+--- /dev/null
++++ b/src/ServerScriptService/Server/PlaceRole.luau
+@@ -0,0 +1,25 @@
++-- PlaceRole (multi-ship phase 2): which half of the game this server runs.
++--   "single" : MULTI_SHIP_ENABLED is off. Today's game: harbor and voyage in the same server (published build).
++--   "harbor" : the shared lobby. Ships, boarding, the Quartermaster; departing crews leave the server.
++--              The voyage loop (GameState) never runs here.
++--   "isle"   : one Lighthouse Isle voyage for one crew (a reserved server). The existing voyage loop runs here.
++
++local ReplicatedStorage = game:GetService("ReplicatedStorage")
++local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
++
++local PlaceRole = {}
++
++function PlaceRole.get()
++	if Config.MULTI_SHIP_ENABLED ~= true then
++		return "single"
++	end
++	if Config.PLACE_ROLE_OVERRIDE == "harbor" or Config.PLACE_ROLE_OVERRIDE == "isle" then
++		return Config.PLACE_ROLE_OVERRIDE
++	end
++	if Config.ISLE_PLACE_ID ~= 0 and game.PlaceId == Config.ISLE_PLACE_ID then
++		return "isle"
++	end
++	return "harbor"
++end
++
++return PlaceRole
+diff --git a/src/ServerScriptService/Server/HarborDepartures.luau b/src/ServerScriptService/Server/HarborDepartures.luau
+new file mode 100644
+index 0000000..b51ab33
+--- /dev/null
++++ b/src/ServerScriptService/Server/HarborDepartures.luau
+@@ -0,0 +1,71 @@
++-- HarborDepartures (multi-ship phase 2, harbor role only): one independent departure countdown per ship.
++--
++-- In the single-server game GameState runs the one departure countdown (Phase "Intermission"). The harbor runs
++-- no voyage, so each ship gets its own countdown here instead. The rules are unchanged and still come from
++-- ShipDeparture: 4/4 starts automatically, 1 to 3 need SAIL NOW, an invalid request cancels at once.
++--   * each ship has its own timer, its own state and its own lock; ships never share a countdown
++--   * at the end the request is revalidated (no yield before the freeze), ShipRoster.depart(id) freezes a fresh
++--     snapshot, and deps.launch(shipId, crew) takes the crew away (teleport, or a Studio simulation)
++--   * the ship takes a new party (ShipRoster.unlock) once launch() returns
++--
++-- Replicated on the GameState folder for the client, per ship:
++--   Ship_<id>_Phase    = "Waiting" | "Countdown" | "Sailing"
++--   Ship_<id>_TimeLeft = whole seconds left in that ship's countdown
++
++local HarborDepartures = {}
++
++local POLL = 0.2
++
++-- deps: roster, departure (ShipDeparture), boarding (ShipBoarding), state, shipIds, seconds,
++--       launch(shipId, crew) -> (yields until the crew has left; errors are caught), log(kind, data)
++function HarborDepartures.start(deps)
++	local function publish(shipId, phase, left)
++		deps.state:SetAttribute("Ship_" .. shipId .. "_Phase", phase)
++		deps.state:SetAttribute("Ship_" .. shipId .. "_TimeLeft", left)
++	end
++
++	local function runShip(shipId)
++		publish(shipId, "Waiting", 0)
++		while true do
++			while not deps.departure.requested(shipId) do
++				task.wait(POLL)
++			end
++			-- countdown: cancelled the moment the request stops being valid (checked BEFORE completion)
++			local endsAt = os.clock() + deps.seconds
++			local completed = false
++			while true do
++				local left = endsAt - os.clock()
++				publish(shipId, "Countdown", math.max(0, math.ceil(left)))
++				if not deps.departure.requested(shipId) then
++					break
++				end
++				if left <= 0 then
++					completed = true
++					break
++				end
++				task.wait(POLL)
++			end
++			if completed and deps.departure.requested(shipId) then -- revalidated; no yield until the freeze
++				local crew = deps.roster.depart(shipId)
++				deps.boarding.departed(crew)
++				deps.departure.departed(shipId)
++				if #crew > 0 then
++					publish(shipId, "Sailing", 0)
++					local ok, err = pcall(deps.launch, shipId, crew)
++					if not ok then
++						warn("[HarborDepartures] launch failed for " .. shipId .. ": " .. tostring(err))
++						deps.log("LaunchFailed", { ship = shipId, err = tostring(err) })
++					end
++				end
++				deps.roster.unlock(shipId)
++			end
++			publish(shipId, "Waiting", 0)
++		end
++	end
++
++	for _, shipId in deps.shipIds do
++		task.spawn(runShip, shipId)
++	end
++end
++
++return HarborDepartures
+diff --git a/src/ServerScriptService/Server/Voyages.luau b/src/ServerScriptService/Server/Voyages.luau
+new file mode 100644
+index 0000000..083ae23
+--- /dev/null
++++ b/src/ServerScriptService/Server/Voyages.luau
+@@ -0,0 +1,142 @@
++-- Voyages (multi-ship phase 2): takes a departed crew from the harbor to its own Lighthouse Isle server,
++-- and brings players back to the harbor.
++--
++-- TELEPORT_ENABLED = false (default, and the only mode usable in Studio): launch() SIMULATES the voyage. The
++-- crew is moved back to the harbor spawn and leaves the party, so boarding and countdowns can be tested.
++--
++-- TELEPORT_ENABLED = true (owner-only, needs the Isle place and a published test environment):
++--   1. ReserveServer(ISLE_PLACE_ID) -> access code + private server id
++--   2. a MANIFEST in MemoryStore (map "Voyages", key = private server id, short expiry): the crew's UserIds,
++--      ship and forecast votes. No balances, inventory or progress ever travel: the Isle loads saves itself.
++--   3. PlayerData.handoff(player) for each member (awaited final save + session release; see SessionLock)
++--   4. TeleportAsync(ISLE_PLACE_ID, crew, options) with ReservedServerAccessCode. TeleportData only carries
++--      { ship } for the loading screen and is never trusted.
++--   A member whose teleport fails stays in the harbor, keeps the party seat (normal boarding rules apply again)
++--   and their save session is re-claimed by the harbor (PlayerData.reclaim). Nothing is deleted.
++
++local Players = game:GetService("Players")
++local ReplicatedStorage = game:GetService("ReplicatedStorage")
++local TeleportService = game:GetService("TeleportService")
++
++local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
++
++local Voyages = {}
++
++local MANIFEST_MAP = "Voyages"
++local MANIFEST_SECONDS = 600
++
++local deps = nil
++
++-- deps: notify(player, text), log(kind, data), sendToHarbor(player) (move to the harbor spawn),
++--       playerData (handoff/reclaim, teleport mode only), roster (ShipRoster)
++function Voyages.init(d)
++	deps = d
++	if Config.TELEPORT_ENABLED then
++		TeleportService.TeleportInitFailed:Connect(function(player, result, message)
++			Voyages.teleportFailed(player, tostring(result) .. " " .. tostring(message))
++		end)
++	end
++end
++
++local function simulate(shipId, crew)
++	deps.log("VoyageLaunched", { ship = shipId, crew = #crew, mode = "simulated" })
++	for _, player in crew do
++		deps.notify(player, "(Studio test) Your ship sailed to Lighthouse Isle. Teleporting is off, so you are back in the harbor.")
++		deps.roster.leave(player, "sailed (simulated)")
++		deps.sendToHarbor(player)
++	end
++end
++
++local function teleport(shipId, crew)
++	assert(Config.ISLE_PLACE_ID ~= 0, "ISLE_PLACE_ID is not set")
++	-- never move a player between servers without the guarded save hand-off
++	assert(deps.playerData and deps.playerData.handoff and deps.playerData.reclaim, "save hand-off adapter not wired: refusing to teleport")
++	local code, privateServerId = TeleportService:ReserveServer(Config.ISLE_PLACE_ID)
++	local userIds = {}
++	for _, player in crew do
++		table.insert(userIds, player.UserId)
++	end
++	local manifest = { ship = shipId, userIds = userIds, createdAt = os.time() }
++	game:GetService("MemoryStoreService"):GetSortedMap(MANIFEST_MAP):SetAsync(privateServerId, manifest, MANIFEST_SECONDS)
++	-- hand every save over before anyone leaves (awaited final save + release); a member whose hand-off
++	-- fails does not travel
++	local travelling = {}
++	for _, player in crew do
++		if deps.playerData.handoff(player) then
++			table.insert(travelling, player)
++		else
++			Voyages.teleportFailed(player, "save hand-off failed")
++		end
++	end
++	if #travelling == 0 then
++		return
++	end
++	local options = Instance.new("TeleportOptions")
++	options.ReservedServerAccessCode = code
++	options:SetTeleportData({ ship = shipId })
++	deps.log("VoyageLaunched", { ship = shipId, crew = #travelling, mode = "teleport", server = privateServerId })
++	local ok, err = pcall(TeleportService.TeleportAsync, TeleportService, Config.ISLE_PLACE_ID, travelling, options)
++	if not ok then
++		for _, player in travelling do
++			Voyages.teleportFailed(player, tostring(err))
++		end
++	end
++end
++
++-- A member who could not travel: still in the harbor, keeps the seat, keeps (re-claims) the save session.
++function Voyages.teleportFailed(player, why)
++	if player.Parent ~= Players then
++		return
++	end
++	deps.log("TeleportFailed", { player = player.Name, why = why })
++	if deps.playerData and deps.playerData.reclaim then
++		deps.playerData.reclaim(player)
++	end
++	if deps.roster.shipOf(player) ~= nil then
++		player:SetAttribute("BoardedByDeck", true) -- normal boarding rules apply again (stepping off frees the seat)
++	end
++	deps.notify(player, "The ship couldn't reach Lighthouse Isle. You're still in the harbor with your crew seat. Try SAIL NOW again.")
++end
++
++-- Called by HarborDepartures at the end of a ship's countdown.
++function Voyages.launch(shipId, crew)
++	if Config.TELEPORT_ENABLED then
++		teleport(shipId, crew)
++	else
++		simulate(shipId, crew)
++	end
++end
++
++-- Isle side: send one player back to a public harbor server (Results "back to harbor", menu, rematch "no").
++-- Returns false when teleporting is off (the caller keeps today's behaviour).
++function Voyages.returnToHarbor(player)
++	if not Config.TELEPORT_ENABLED then
++		return false
++	end
++	if not (deps.playerData and deps.playerData.handoff) then
++		warn("[Voyages] save hand-off adapter not wired: not teleporting " .. player.Name)
++		return false
++	end
++	if not deps.playerData.handoff(player) then
++		deps.notify(player, "Saving your progress before the trip back failed. Try again in a moment.")
++		return true
++	end
++	local ok, err = pcall(TeleportService.TeleportAsync, TeleportService, Config.HARBOR_PLACE_ID, { player })
++	if not ok then
++		Voyages.teleportFailed(player, tostring(err))
++	end
++	return true
++end
++
++-- Isle side: read this reserved server's manifest. Returns nil outside a reserved server or when missing.
++function Voyages.readManifest()
++	if not Config.TELEPORT_ENABLED or game.PrivateServerId == "" then
++		return nil
++	end
++	local ok, manifest = pcall(function()
++		return game:GetService("MemoryStoreService"):GetSortedMap(MANIFEST_MAP):GetAsync(game.PrivateServerId)
++	end)
++	return if ok then manifest else nil
++end
++
++return Voyages
+diff --git a/src/ServerScriptService/Server/IsleAdmission.luau b/src/ServerScriptService/Server/IsleAdmission.luau
+new file mode 100644
+index 0000000..aa3cf41
+--- /dev/null
++++ b/src/ServerScriptService/Server/IsleAdmission.luau
+@@ -0,0 +1,109 @@
++-- IsleAdmission (multi-ship phase 2, isle role only): who the crew of this Lighthouse Isle server is, and when
++-- its voyage starts. It plugs into the EXISTING voyage loop (GameState) through the same two hooks the
++-- single-server game uses (deps.departure and deps.departShip), so no game logic is duplicated.
++--
++--   * reserved server with a manifest (Voyages): only the listed UserIds are crew; anyone else is sent back to
++--     the harbor. The voyage starts when everyone listed has arrived, or ISLE_ARRIVAL_WAIT seconds after the
++--     first one did (crew-size scaling already uses the real count).
++--   * no manifest (Studio test with PLACE_ROLE_OVERRIDE = "isle"): everyone who joins is crew, same timing.
++--   * Play Again: the players who chose it sail again in this same server (GameState's rematch flow).
++
++local Players = game:GetService("Players")
++local ReplicatedStorage = game:GetService("ReplicatedStorage")
++
++local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
++
++local IsleAdmission = {}
++
++local SHIP_ID = "Isle"
++
++local deps = nil
++local expected = nil -- { [userId] = true } from the manifest, or nil = anyone
++local expectedCount = 0
++local firstArrival = nil
++local started = false
++local rematchWanted = false
++
++local function admitted()
++	local list = {}
++	for _, player in Players:GetPlayers() do
++		if player:GetAttribute("InLobby") == true and (expected == nil or expected[player.UserId]) then
++			table.insert(list, player)
++		end
++	end
++	return list
++end
++
++-- deps: manifest (table or nil), sendToHarbor(player), log(kind, data)
++function IsleAdmission.init(d)
++	deps = d
++	if d.manifest and d.manifest.userIds then
++		expected = {}
++		for _, id in d.manifest.userIds do
++			expected[id] = true
++			expectedCount += 1
++		end
++	end
++	local function onJoin(player)
++		if expected and not expected[player.UserId] then
++			deps.log("IsleRefused", { player = player.Name })
++			deps.sendToHarbor(player)
++		end
++	end
++	Players.PlayerAdded:Connect(onJoin)
++	for _, player in Players:GetPlayers() do
++		onJoin(player)
++	end
++end
++
++-- GameState: is there a voyage to start?
++function IsleAdmission.requested()
++	if started then
++		if not rematchWanted then
++			return false
++		end
++		for _, player in Players:GetPlayers() do
++			if player:GetAttribute("Ready") == true then
++				return true
++			end
++		end
++		rematchWanted = false -- everyone who wanted it left
++		return false
++	end
++	local list = admitted()
++	if #list == 0 then
++		return false
++	end
++	firstArrival = firstArrival or os.clock()
++	local everyone = expected ~= nil and #list >= expectedCount
++	return everyone or os.clock() - firstArrival >= (Config.ISLE_ARRIVAL_WAIT or 20)
++end
++
++-- GameState: the countdown finished; these players sail (the existing loop takes them to the lighthouse).
++function IsleAdmission.depart()
++	if started and rematchWanted then
++		rematchWanted = false
++		local crew = {}
++		for _, player in Players:GetPlayers() do
++			if player:GetAttribute("Ready") == true then
++				table.insert(crew, player)
++			end
++		end
++		return crew
++	end
++	started = true
++	local crew = admitted()
++	for _, player in crew do
++		player:SetAttribute("ShipId", SHIP_ID)
++		player:SetAttribute("Ready", true)
++	end
++	deps.log("IsleVoyage", { crew = #crew, expected = expectedCount })
++	return crew
++end
++
++-- GameState: Play Again was chosen by at least one crew member
++function IsleAdmission.rematch()
++	rematchWanted = true
++end
++
++return IsleAdmission
+diff --git a/src/ServerScriptService/Server/SessionLock.luau b/src/ServerScriptService/Server/SessionLock.luau
+new file mode 100644
+index 0000000..45dd953
+--- /dev/null
++++ b/src/ServerScriptService/Server/SessionLock.luau
+@@ -0,0 +1,170 @@
++-- SessionLock (multi-ship phase 2): a save-session lock for moving players between servers (harbor <-> isle).
++-- NOT WIRED into PlayerData. Production saving is unchanged. Tested only against a fake in-memory store.
++--
++-- The lock lives in the DataStore key's METADATA (UpdateAsync can return value, userIds, metadata), so the saved
++-- profile itself never changes format. metadata.session = { token, job, at }:
++--   * token : a unique fencing token per claim (GUID). Every write must present the current token.
++--   * job   : the claiming server's JobId (for logs)
++--   * at    : last heartbeat (os.time). A session older than staleSeconds may be taken over (crashed server).
++--
++-- Rules (auditor list, 2026-10-15):
++--   1. claim(): atomic in UpdateAsync. If another live session holds the key, the write is cancelled (nil) and
++--      claim retries until waitSeconds, then fails (the caller keeps the player in memory-only mode).
++--   2. save(): atomic ownership check inside UpdateAsync; a stale or foreign token cancels the write.
++--   3. heartbeat(): refreshes `at` even when the profile is unchanged (same ownership check).
++--   4. Existing metadata fields and the key's UserIds are always carried over.
++--   5. release(): an awaited final save that also clears the session. After it, this lock refuses to write.
++--   6. reclaim after a failed teleport: claim() again; it succeeds at once because the key is free (or ours).
++--   7. Per-key operations are serialized (one at a time, in call order), so PlayerRemoving, autosave and
++--      release can never interleave inside one server.
++--   8. Old servers (pre-lock code) write without metadata, which clears any session. The lock then sees the key
++--      as free. Deploy only with "Shut down all servers" / "Migrate to latest update" so no old server runs
++--      beside new ones (see the phase 2 package).
++
++local HttpService = game:GetService("HttpService")
++
++local SessionLock = {}
++SessionLock.__index = SessionLock
++
++-- opts: store (UpdateAsync-compatible), jobId, staleSeconds (120), waitSeconds (15), now (os.time), sleep (task.wait)
++function SessionLock.new(opts)
++	return setmetatable({
++		store = opts.store,
++		jobId = opts.jobId or game.JobId,
++		staleSeconds = opts.staleSeconds or 120,
++		waitSeconds = opts.waitSeconds or 15,
++		now = opts.now or os.time,
++		sleep = opts.sleep or task.wait,
++		tokens = {}, -- key -> our current token (nil = not owned)
++		queues = {}, -- key -> { busy = bool, waiting = { threads } }
++	}, SessionLock)
++end
++
++local function copyMeta(keyInfo)
++	local meta = {}
++	if keyInfo then
++		for k, v in keyInfo:GetMetadata() or {} do
++			meta[k] = v
++		end
++	end
++	return meta
++end
++
++local function userIdsOf(keyInfo)
++	return if keyInfo then keyInfo:GetUserIds() else {}
++end
++
++-- serialize every operation on one key
++function SessionLock:_run(key, fn)
++	local q = self.queues[key]
++	if not q then
++		q = { busy = false, waiting = {} }
++		self.queues[key] = q
++	end
++	if q.busy then
++		table.insert(q.waiting, coroutine.running())
++		coroutine.yield()
++	end
++	q.busy = true
++	local results = table.pack(pcall(fn))
++	local nextThread = table.remove(q.waiting, 1)
++	if nextThread then
++		task.defer(nextThread) -- stays busy: ownership passes straight to the next waiter
++	else
++		q.busy = false
++	end
++	if not results[1] then
++		return false, tostring(results[2])
++	end
++	return table.unpack(results, 2, results.n)
++end
++
++-- Returns ok, value (the stored profile, possibly nil for a new player), reason
++function SessionLock:claim(key)
++	return self:_run(key, function()
++		local started = self.now()
++		while true do
++			local token = HttpService:GenerateGUID(false)
++			local busy, value = false, nil
++			local ok, err = pcall(function()
++				self.store:UpdateAsync(key, function(current, keyInfo)
++					local meta = copyMeta(keyInfo)
++					local s = meta.session
++					local mine = s ~= nil and s.token == self.tokens[key]
++					if s ~= nil and not mine and type(s.at) == "number" and self.now() - s.at < self.staleSeconds then
++						busy = true
++						return nil -- another live session: cancel the write
++					end
++					meta.session = { token = token, job = self.jobId, at = self.now() }
++					value = current
++					return current, userIdsOf(keyInfo), meta
++				end)
++			end)
++			if ok and not busy then
++				self.tokens[key] = token
++				return true, value, "claimed"
++			end
++			if self.now() - started >= self.waitSeconds then
++				return false, nil, if busy then "locked by another server" else "store error: " .. tostring(err)
++			end
++			self.sleep(1)
++		end
++	end)
++end
++
++-- shared body of save / heartbeat / release. newValue == nil keeps the stored value.
++function SessionLock:_write(key, newValue, releaseAfter)
++	local token = self.tokens[key]
++	if token == nil then
++		return false, "not owned"
++	end
++	local lost = false
++	local ok, err = pcall(function()
++		self.store:UpdateAsync(key, function(current, keyInfo)
++			local meta = copyMeta(keyInfo)
++			if meta.session == nil or meta.session.token ~= token then
++				lost = true
++				return nil -- fenced: somebody else owns the key now
++			end
++			meta.session = if releaseAfter then nil else { token = token, job = self.jobId, at = self.now() }
++			local value = if newValue ~= nil then newValue else current
++			return value, userIdsOf(keyInfo), meta
++		end)
++	end)
++	if lost then
++		self.tokens[key] = nil
++		return false, "lock lost"
++	end
++	if not ok then
++		return false, "store error: " .. tostring(err) -- still owned; the caller retries later
++	end
++	if releaseAfter then
++		self.tokens[key] = nil
++	end
++	return true, if releaseAfter then "released" else "saved"
++end
++
++function SessionLock:save(key, value)
++	return self:_run(key, function()
++		return self:_write(key, value, false)
++	end)
++end
++
++function SessionLock:heartbeat(key)
++	return self:_run(key, function()
++		return self:_write(key, nil, false)
++	end)
++end
++
++-- awaited final save + release (before a teleport, or when the player leaves)
++function SessionLock:release(key, value)
++	return self:_run(key, function()
++		return self:_write(key, value, true)
++	end)
++end
++
++function SessionLock:owns(key)
++	return self.tokens[key] ~= nil
++end
++
++return SessionLock

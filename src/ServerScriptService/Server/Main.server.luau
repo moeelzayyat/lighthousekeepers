@@ -26,6 +26,13 @@ local ShipRoster = require(script.Parent.ShipRoster)
 local ShipBoarding = require(script.Parent.ShipBoarding)
 local ShipDeparture = require(script.Parent.ShipDeparture)
 local VoyageCast = require(script.Parent.VoyageCast)
+local PlaceRole = require(script.Parent.PlaceRole)
+local HarborDepartures = require(script.Parent.HarborDepartures)
+local Voyages = require(script.Parent.Voyages)
+local IsleAdmission = require(script.Parent.IsleAdmission)
+
+-- Multi-ship phase 2: "single" (MULTI_SHIP_ENABLED off, the published game, unchanged), "harbor" or "isle"
+local ROLE = PlaceRole.get()
 
 -- Shared state the HUD reads (attributes replicate to every client automatically)
 local stateFolder = Instance.new("Folder")
@@ -56,6 +63,8 @@ remotes.Parent = ReplicatedStorage
 
 local refs = IslandBuilder.build()
 local lobbyRefs = LobbyBuilder.build(refs) -- the pirate-ship lobby (also moves the Quartermaster aboard)
+-- harbor role: more departure ships, each with its own BoardingZone and wheel ({ [shipId] = refs })
+local extraShips = if ROLE == "harbor" then LobbyBuilder.buildExtraShips(lobbyRefs) else {}
 LampService.init(refs, stateFolder, remotes)
 TowerService.init(stateFolder, refs.repairPrompt, LampService.notify)
 PlayerData.init(remotes, LampService.notify)
@@ -598,6 +607,9 @@ local function sendToShip(player)
 	if LampService.getKeeper() == player then
 		LampService.setKeeper(nil, "leave")
 	end
+	if ROLE == "isle" and Voyages.returnToHarbor(player) then
+		return -- isle: leaving the crew means sailing back to the harbor place
+	end
 	task.spawn(moveCharacterTo, player, lobbyRefs.spawn.CFrame)
 end
 
@@ -649,14 +661,30 @@ end)
 -- Ship parties (batch 1 revision): the lobby holds the whole server; each departure ship takes a party of at
 -- most Config.MAX_CREW. ShipRoster is the only thing that puts a player in a crew (Ready = true).
 local SHIP_ID = "Ship1" -- the existing pirate ship
-ShipRoster.init(stateFolder, Config.MAX_CREW or 4, { SHIP_ID })
+-- multi-ship phase 2: the harbor has more ships; each has its own roster, BoardingZone, wheel and countdown
+local SHIP_IDS = { SHIP_ID }
+local shipZones = { [SHIP_ID] = lobbyRefs.boardingZone }
+local shipPrompts = { [SHIP_ID] = lobbyRefs.helmPrompt }
+for shipId, ship in extraShips do
+	table.insert(SHIP_IDS, shipId)
+	shipZones[shipId] = ship.boardingZone
+	shipPrompts[shipId] = ship.helmPrompt
+end
+table.sort(SHIP_IDS)
+ShipRoster.init(stateFolder, Config.MAX_CREW or 4, SHIP_IDS)
+stateFolder:SetAttribute("MultiShip", ROLE == "harbor")
 
 -- Boarding batch: standing in the ship's BoardingZone joins its party (no button).
 -- Departure revision: boarding never starts a departure. ShipDeparture does: automatically at 4/4, or when a
 -- crew member of a party of 1 to 3 uses SAIL NOW at the ship's wheel.
+if ROLE == "isle" then
+	-- isle: the crew comes from the voyage manifest, not from boarding a ship
+	lobbyRefs.helmPrompt.Enabled = false
+	shipZones = {}
+end
 ShipBoarding.init({
 	roster = ShipRoster,
-	zones = { [SHIP_ID] = lobbyRefs.boardingZone },
+	zones = shipZones,
 	notify = LampService.notify,
 	log = EventLog.log,
 	mark = EventLog.mark,
@@ -667,7 +695,7 @@ ShipBoarding.init({
 ShipDeparture.init({
 	roster = ShipRoster,
 	state = stateFolder,
-	shipIds = { SHIP_ID },
+	shipIds = if ROLE == "isle" then {} else SHIP_IDS,
 	notify = LampService.notify,
 	log = EventLog.log,
 })
@@ -680,16 +708,18 @@ local SAIL_REFUSED = {
 	already = "The ship is already preparing to sail.",
 	full = "The crew is full: the ship sails automatically.",
 }
-lobbyRefs.helmPrompt.Triggered:Connect(function(player)
-	if not player:GetAttribute("InLobby") then
-		return
-	end
-	local ok, reason = ShipDeparture.sailNow(player, SHIP_ID)
-	if not ok then
-		LampService.notify(player, SAIL_REFUSED[reason] or "You can't sail right now.")
-		EventLog.log("SailNowRefused", { player = player.Name, reason = reason, ship = SHIP_ID })
-	end
-end)
+for shipId, prompt in shipPrompts do
+	prompt.Triggered:Connect(function(player)
+		if ROLE == "isle" or not player:GetAttribute("InLobby") then
+			return
+		end
+		local ok, reason = ShipDeparture.sailNow(player, shipId)
+		if not ok then
+			LampService.notify(player, SAIL_REFUSED[reason] or "You can't sail right now.")
+			EventLog.log("SailNowRefused", { player = player.Name, reason = reason, ship = shipId })
+		end
+	end)
+end
 
 -- First-voyage route (launch R2). A player whose profile loaded cleanly with 0 completed runs skips
 -- the title and lands on the ship's deck, where the wheel signs them up (batch 1 revision: they are no
@@ -705,10 +735,11 @@ local function chooseRoute(player)
 		return
 	end
 	local profileState = player:GetAttribute("ProfileState")
-	local fast = Config.FIRST_VOYAGE_FAST_PATH == true
-		and (profileState == "saved" or profileState == "memory")
-		and player:GetAttribute("RunsCompleted") == 0
-		and not player:GetAttribute("InLobby")
+	local fast = ROLE == "isle" -- isle: the crew arrives straight from the harbor, no title screen
+		or (Config.FIRST_VOYAGE_FAST_PATH == true
+			and (profileState == "saved" or profileState == "memory")
+			and player:GetAttribute("RunsCompleted") == 0
+			and not player:GetAttribute("InLobby"))
 	EventLog.setRoute(player, if fast then "fast" elseif profileState == "failed" then "failed-load" elseif profileState == nil then "slow-load" else "title")
 	if not fast then
 		player:SetAttribute("Route", "title")
@@ -725,7 +756,7 @@ local function chooseRoute(player)
 	player:SetAttribute("InLobby", true)
 	EventLog.log("EnteredLobby", { player = player.Name, via = "first voyage" })
 	task.wait(0.4)
-	if player.Parent == Players and not player:GetAttribute("Ready") then
+	if ROLE ~= "isle" and player.Parent == Players and not player:GetAttribute("Ready") then
 		LampService.notify(player, "The storm is coming and the light needs keepers. Walk onto the ship to join the crew.")
 	end
 end
@@ -871,6 +902,42 @@ local function resetRound()
 	end
 end
 
+-- Multi-ship phase 2 wiring. "single" (the published game) skips all of this and runs GameState as before.
+Voyages.init({
+	notify = LampService.notify,
+	log = EventLog.log,
+	roster = ShipRoster,
+	playerData = nil, -- the save hand-off adapter (SessionLock) is NOT wired: Voyages refuses to teleport without it
+	sendToHarbor = function(player)
+		task.spawn(moveCharacterTo, player, lobbyRefs.spawn.CFrame)
+	end,
+})
+if ROLE == "harbor" then
+	-- the harbor never runs the voyage loop: each ship counts down on its own and its crew leaves the server
+	HarborDepartures.start({
+		roster = ShipRoster,
+		departure = ShipDeparture,
+		boarding = ShipBoarding,
+		state = stateFolder,
+		shipIds = SHIP_IDS,
+		seconds = Config.INTERMISSION_SECONDS,
+		launch = Voyages.launch,
+		log = EventLog.log,
+	})
+	return
+end
+if ROLE == "isle" then
+	IsleAdmission.init({
+		manifest = Voyages.readManifest(),
+		log = EventLog.log,
+		sendToHarbor = function(player)
+			if not Voyages.returnToHarbor(player) then
+				player:Kick("This Lighthouse Isle voyage belongs to another crew.")
+			end
+		end,
+	})
+end
+
 GameState.run({
 	lamp = LampService,
 	tower = TowerService,
@@ -883,7 +950,7 @@ GameState.run({
 	state = stateFolder,
 	remotes = remotes,
 	resetRound = resetRound,
-	departure = {
+	departure = if ROLE == "isle" then IsleAdmission else {
 		requested = function()
 			return ShipDeparture.requested(SHIP_ID)
 		end,
@@ -891,7 +958,7 @@ GameState.run({
 			ShipDeparture.rematch(SHIP_ID)
 		end,
 	},
-	departShip = function()
+	departShip = if ROLE == "isle" then IsleAdmission.depart else function()
 		local sailing = ShipRoster.depart(SHIP_ID) -- freezes the party; only these players sail
 		ShipBoarding.departed(sailing) -- their seats no longer depend on standing on the deck
 		ShipDeparture.departed(SHIP_ID) -- the departure request is used up

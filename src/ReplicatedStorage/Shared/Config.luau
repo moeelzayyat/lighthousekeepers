@@ -47,6 +47,15 @@ local Config = {
 	FUEL_PER_REFILL = 40, -- one barrel of oil
 	FUEL_DRAIN_BY_CREW_SIZE = { 0.7, 0.85, 1, 1 }, -- drain multiplier for 1, 2, 3, 4 players (solo can't refuel and keep the lamp at once)
 	MAX_CREW = 4, -- party size of ONE departure ship (batch 1 revision); the lobby itself holds the whole server
+
+	-- Multi-ship (phase 2 foundation). ALL OFF in the published game: with MULTI_SHIP_ENABLED = false the
+	-- place runs exactly as before (one ship, the voyage in this same server).
+	MULTI_SHIP_ENABLED = false, -- harbor/isle place roles and a second departure ship
+	TELEPORT_ENABLED = false, -- send crews to reserved Lighthouse Isle servers (needs the Isle place; owner-only)
+	PLACE_ROLE_OVERRIDE = nil, -- Studio testing only: "harbor" or "isle" (nil = decided by PlaceId)
+	HARBOR_PLACE_ID = 132065051336560, -- the Lighthouse Keepers start place
+	ISLE_PLACE_ID = 0, -- the Lighthouse Isle place, once the owner creates it (0 = not created)
+	ISLE_ARRIVAL_WAIT = 20, -- isle: seconds to wait for the whole crew before the voyage starts anyway
 	DAWN_LOOT_SECONDS = 25, -- leftover loot stays this long into the day at full value (was 10; owner, Oct 12)
 	DAWN_LOOT_FRACTION = 0.5, -- at dawn the tide brings leftover loot to the crew at this fraction of its value
 	DARK_GRACE_SECONDS = 10, -- how long the lamp can be out before the run is lost

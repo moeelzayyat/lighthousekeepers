@@ -239,15 +239,11 @@ local travelTexts = { travelTitle, travelSub }
 -- THE SHIP'S WHEEL (world sign + your prompt text)
 ---------------------------------------------------------------------
 
-local wheelSign, signState, signDetail, helmPrompt
+-- one sign per ship's wheel (multi-ship phase 2: the harbor can have several ships; prompt attribute ShipId)
+local wheels = {} -- { { prompt, shipId, sign, state, detail } }
 
-local function bindWheel()
-	local lobby = lobbyFolder()
-	helmPrompt = lobby and lobby:FindFirstChild("HelmPrompt", true)
-	if not helmPrompt or wheelSign then
-		return
-	end
-	wheelSign = UiKit.new("BillboardGui", {
+local function makeSign(helmPrompt)
+	local wheelSign = UiKit.new("BillboardGui", {
 		Name = "WheelSign",
 		Adornee = helmPrompt.Parent,
 		Size = UDim2.fromOffset(240, 62),
@@ -261,7 +257,7 @@ local function bindWheel()
 	UiKit.round(plate, UiKit.Radius.card)
 	UiKit.border(plate, C.BorderBrassBright, 1.5, 0.15)
 	UiKit.Brackets(plate, C.AccentLighthouse, 8, 2, 0)
-	signState = UiKit.new("TextLabel", {
+	local signState = UiKit.new("TextLabel", {
 		Name = "State",
 		BackgroundTransparency = 1,
 		FontFace = F.LabelBold,
@@ -270,7 +266,7 @@ local function bindWheel()
 		Position = UDim2.fromOffset(0, 6),
 		Size = UDim2.new(1, 0, 0, 26),
 	}, plate)
-	signDetail = UiKit.new("TextLabel", {
+	local signDetail = UiKit.new("TextLabel", {
 		Name = "Detail",
 		BackgroundTransparency = 1,
 		FontFace = F.BodyMedium,
@@ -279,6 +275,27 @@ local function bindWheel()
 		Position = UDim2.fromOffset(0, 32),
 		Size = UDim2.new(1, 0, 0, 22),
 	}, plate)
+	table.insert(wheels, { prompt = helmPrompt, shipId = helmPrompt:GetAttribute("ShipId") or "Ship1", sign = wheelSign, state = signState, detail = signDetail })
+end
+
+local function bindWheel()
+	local lobby = lobbyFolder()
+	if not lobby then
+		return
+	end
+	for _, d in lobby:GetDescendants() do
+		if d:IsA("ProximityPrompt") and d.Name == "HelmPrompt" then
+			local known = false
+			for _, w in wheels do
+				if w.prompt == d then
+					known = true
+				end
+			end
+			if not known then
+				makeSign(d)
+			end
+		end
+	end
 end
 
 ---------------------------------------------------------------------
@@ -343,38 +360,58 @@ local function render()
 	local underway = RUN_PHASES[phase] == true
 	local key = inputKey()
 
-	-- the wheel sign: everyone nearby reads the same departure state
+	-- the wheel signs: everyone nearby reads the same departure state
 	local capacity = state:GetAttribute("ShipCapacity") or 4
+	local multi = state:GetAttribute("MultiShip") == true -- harbor with several ships, each with its own countdown
+	local shipId = shownShip()
+	-- one ship's departure state. Single-server game: the global Phase/TimeLeft; harbor: that ship's own countdown
+	local function shipView(id)
+		local count = if id == shipId then crewCount else (state:GetAttribute("Ship_" .. id .. "_Count") or 0)
+		local view = { count = count, departure = state:GetAttribute("Ship_" .. id .. "_Departure") }
+		if multi then
+			local shipPhase = state:GetAttribute("Ship_" .. id .. "_Phase") or "Waiting"
+			view.sailing = shipPhase == "Countdown"
+			view.left = state:GetAttribute("Ship_" .. id .. "_TimeLeft") or 0
+			view.underway = shipPhase == "Sailing"
+			view.inPort = shipPhase == "Waiting"
+		else
+			view.sailing, view.left, view.underway, view.inPort = sailing, left, underway, phase == "Waiting"
+		end
+		return view
+	end
+	local mine = shipView(shipId)
+	if multi then
+		sailing, left, underway = mine.sailing, mine.left, mine.underway
+	end
 	local seats = string.format("%d/%d", crewCount, capacity)
 	local full = crewCount >= capacity
-	local shipId = shownShip()
-	local departure = state:GetAttribute("Ship_" .. shipId .. "_Departure") -- "auto" | "manual" | "rematch" | nil
+	local departure = mine.departure -- "auto" | "manual" | "rematch" | nil
 	local leaving = sailing and departure ~= nil
-	if wheelSign then
-		if underway then
-			signState.Text = "AT SEA"
-			signDetail.Text = seats .. " crew · next voyage soon"
-			signState.TextColor3 = C.AccentSea
-		elseif leaving then
-			signState.Text = "LEAVING IN " .. clock(left)
-			signDetail.Text = if full then seats .. " crew · crew full" elseif departure == "manual" then seats .. " crew · SAIL NOW called" else seats .. " crew · walk aboard to join"
-			signState.TextColor3 = if left <= 5 then C.StateWarning else C.AccentLighthouse
-		elseif crewCount == 0 then
-			signState.Text = "WAITING FOR CREW"
-			signDetail.Text = "0/" .. capacity .. " · walk aboard to join"
-			signState.TextColor3 = C.AccentLighthouse
+	for _, w in wheels do
+		local v = shipView(w.shipId)
+		local wSeats = string.format("%d/%d", v.count, capacity)
+		if v.underway then
+			w.state.Text = "AT SEA"
+			w.detail.Text = wSeats .. " crew · next voyage soon"
+			w.state.TextColor3 = C.AccentSea
+		elseif v.sailing and v.departure ~= nil then
+			w.state.Text = "LEAVING IN " .. clock(v.left)
+			w.detail.Text = if v.count >= capacity then wSeats .. " crew · crew full" elseif v.departure == "manual" then wSeats .. " crew · SAIL NOW called" else wSeats .. " crew · walk aboard to join"
+			w.state.TextColor3 = if v.left <= 5 then C.StateWarning else C.AccentLighthouse
+		elseif v.count == 0 then
+			w.state.Text = "WAITING FOR CREW"
+			w.detail.Text = "0/" .. capacity .. " · walk aboard to join"
+			w.state.TextColor3 = C.AccentLighthouse
 		else
-			signState.Text = "CREW " .. seats
-			signDetail.Text = "Waiting for crew · SAIL NOW at the wheel"
-			signState.TextColor3 = C.AccentLighthouse
+			w.state.Text = "CREW " .. wSeats
+			w.detail.Text = "Waiting for crew · SAIL NOW at the wheel"
+			w.state.TextColor3 = C.AccentLighthouse
 		end
-	end
-	-- SAIL NOW: only a member of this ship's party of 1 to 3, in port, before any departure has started
-	-- (local visibility only; the server checks every press)
-	if helmPrompt then
-		helmPrompt.Enabled = ready and player:GetAttribute("ShipId") == shipId and crewCount >= 1 and crewCount < capacity
-			and departure == nil and phase == "Waiting"
-		helmPrompt.ActionText = string.format("Sail now (%s)", seats)
+		-- SAIL NOW: only a member of this ship's party of 1 to 3, in port, before any departure has started
+		-- (local visibility only; the server checks every press)
+		w.prompt.Enabled = ready and player:GetAttribute("ShipId") == w.shipId and v.count >= 1 and v.count < capacity
+			and v.departure == nil and v.inPort
+		w.prompt.ActionText = string.format("Sail now (%s)", wSeats)
 	end
 
 	local hidden = player:GetAttribute("MenuOpen") == true
