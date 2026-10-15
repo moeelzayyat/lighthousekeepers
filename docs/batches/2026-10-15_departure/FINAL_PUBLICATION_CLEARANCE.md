@@ -107,3 +107,19 @@ The night measurement matches the 2-crew multiplier (0.85) to within 0.2%, and i
 
 ## Confirmation
 The code in Studio matches the reviewed build: the hashes above were verified in Studio after the final edit and equal the committed files. **Clearance status: ready for the owner's manual publish of Lighthouse Keepers**, subject to the auditor's acceptance of FIX 2 and this evidence. Nothing has been published.
+
+## Auditor verdict (2026-10-15, on commit 86db39f)
+**APPROVED FOR MANUAL PUBLISH.**
+- FIX 2 was accepted.
+- The multiplayer fuel test was accepted: 1.273/s measured against 1.275/s expected for 2 crew.
+- FIX 1 was approved earlier.
+- The known limitations are documented and are not blockers for a friends-only test build:
+  - one voyage per server;
+  - the 1 s exit grace at lock time.
+- Next priority after publishing: feedback from friends (confusing UI, combat responsiveness, onboarding, bugs, difficulty).
+
+**Pre-publish identity check (read-only, after the verdict):**
+- The open Studio window is "Lighthouse Keepers - Staging", PlaceId 132065051336560, GameId 10769064643.
+- All 7 scripts MATCH the hashes above.
+- The Studio API probe was rejected: access is OFF.
+- The owner saves a fresh local backup (`v158_pre-publish`) and then publishes manually.
