@@ -1,4 +1,5 @@
--- Departure (client): joining the crew at the ship's wheel and sailing to the lighthouse.
+-- Departure (client): boarding a ship's crew and sailing to the lighthouse.
+-- Boarding batch: walking onto the ship joins its party (the server decides); the wheel prompt is off.
 --
 -- Mostly world-integrated, no big menu:
 --   * the SHIP'S WHEEL sign (a billboard on the wheel) shows the departure state to everyone nearby
@@ -28,10 +29,17 @@ local RUN_PHASES = { Prologue = true, Day = true, Night = true }
 local NEAR_SHIP = 160 -- studs from the ship: "you're at the harbor"
 local MAX_ROSTER = 4
 
+-- the ship whose party this player sees: their own, else the one they stand on, else the existing ship
+local function shownShip()
+	return player:GetAttribute("ShipId") or player:GetAttribute("NearShip") or "Ship1"
+end
+
+-- members of ONE ship's party (never the whole server)
 local function crewList()
 	local list = {}
+	local shipId = shownShip()
 	for _, p in Players:GetPlayers() do
-		if p:GetAttribute("Ready") then
+		if p:GetAttribute("ShipId") == shipId then
 			table.insert(list, p)
 		end
 	end
@@ -272,6 +280,51 @@ local function bindWheel()
 end
 
 ---------------------------------------------------------------------
+-- VOYAGE CREW (boarding batch): during a voyage, only YOUR ship's crew is listed. Roblox's server-wide
+-- player list is hidden while this panel shows and comes back in the harbor.
+---------------------------------------------------------------------
+
+local StarterGui = game:GetService("StarterGui")
+local voyageCard = UiKit.Panel(root, { name = "VoyageCrew", kind = "plain", variant = "primary", padding = 0, anchor = Vector2.new(0, 0.5) })
+UiKit.border(voyageCard, C.BorderStructural, 1, 0.35)
+voyageCard.Visible = false
+voyageCard.BackgroundTransparency = 0.15
+voyageCard:FindFirstChild("Content"):Destroy()
+voyageCard.AutomaticSize = Enum.AutomaticSize.Y
+local voyageBody = UiKit.new("Frame", { Name = "Body", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y }, voyageCard)
+UiKit.pad(voyageBody, 8, 10, 8, 10)
+UiKit.list(voyageBody, "y", 2)
+local voyageTitle = UiKit.Label(voyageBody, "CREW", "Eyebrow", { Name = "Title", LayoutOrder = 0, Size = UDim2.new(1, 0, 0, 16), AutomaticSize = Enum.AutomaticSize.None, TextWrapped = false })
+local voyageRows = {}
+for i = 1, MAX_ROSTER do
+	voyageRows[i] = UiKit.Label(voyageBody, "", "BodySmall", { Name = "Crew" .. i, LayoutOrder = i, Size = UDim2.new(1, 0, 0, 18), AutomaticSize = Enum.AutomaticSize.None, TextWrapped = false, TextTruncate = Enum.TextTruncate.AtEnd, TextColor3 = C.TextPrimary, Visible = false })
+end
+local playerListHidden = false
+local function setPlayerListHidden(hide)
+	if hide ~= playerListHidden and pcall(StarterGui.SetCoreGuiEnabled, StarterGui, Enum.CoreGuiType.PlayerList, not hide) then
+		playerListHidden = hide
+	end
+end
+
+local function renderVoyageCrew(show, crew, seats)
+	voyageCard.Visible = show
+	setPlayerListHidden(show) -- only once the crew panel is actually on screen
+	if not show then
+		return
+	end
+	voyageTitle.Text = "CREW · " .. seats
+	local keeperId = state:GetAttribute("KeeperUserId") or 0
+	for i, label in voyageRows do
+		local p = crew[i]
+		label.Visible = p ~= nil
+		if p then
+			local name = if p == player then p.DisplayName .. " (you)" else p.DisplayName
+			label.Text = if p.UserId == keeperId then name .. " · Keeper" else name
+		end
+	end
+end
+
+---------------------------------------------------------------------
 -- RENDER (a light poll: a few labels, four times a second)
 ---------------------------------------------------------------------
 
@@ -289,24 +342,27 @@ local function render()
 	local key = inputKey()
 
 	-- the wheel sign: everyone nearby reads the same departure state
+	local capacity = state:GetAttribute("ShipCapacity") or 4
+	local seats = string.format("%d/%d", crewCount, capacity)
+	local full = crewCount >= capacity
 	if wheelSign then
 		if underway then
-			signState.Text = "VOYAGE UNDERWAY"
-			signDetail.Text = string.format("%d in crew · join mid-voyage", crewCount)
+			signState.Text = "AT SEA"
+			signDetail.Text = seats .. " crew · next voyage soon"
 			signState.TextColor3 = C.AccentSea
+		elseif full then
+			signState.Text = "CREW FULL " .. seats
+			signDetail.Text = if sailing then "Leaving in " .. clock(left) else "Find another ship"
+			signState.TextColor3 = C.StateWarning
 		elseif sailing then
 			signState.Text = "LEAVING IN " .. clock(left)
-			signDetail.Text = string.format("%d in crew · join now", crewCount)
+			signDetail.Text = seats .. " crew · walk aboard to join"
 			signState.TextColor3 = if left <= 5 then C.StateWarning else C.AccentLighthouse
 		else
-			signState.Text = "SET SAIL"
-			signDetail.Text = if crewCount > 0 then string.format("%d in crew", crewCount) else "Join the crew here"
+			signState.Text = "CREW " .. seats
+			signDetail.Text = "Walk aboard to join"
 			signState.TextColor3 = C.AccentLighthouse
 		end
-	end
-	-- the prompt speaks to you (local only; the server decides what the wheel does)
-	if helmPrompt then
-		helmPrompt.ActionText = if ready then "Leave the crew" elseif underway then "Join mid-voyage" else "Join the crew"
 	end
 
 	local hidden = player:GetAttribute("MenuOpen") == true
@@ -314,29 +370,36 @@ local function render()
 
 	-- harbor status card: ashore and not in the crew
 	local showHarbor = ashore and not ready and not hidden
+	local refused = player:GetAttribute("BoardRefused")
 	harbor.Visible = showHarbor
 	if showHarbor then
 		keycap.Text = key
-		if underway then
-			harborEyebrow.Text = string.upper(string.format("Voyage underway · %d in crew", crewCount))
+		if refused == "full" then
+			harborEyebrow.Text = "CREW FULL · " .. seats
+			harborEyebrow.TextColor3 = C.StateWarning
+			harborBody.Text = "Crew full. Find another ship and sail, or wait here for the next voyage."
+		elseif underway or refused == "sailed" then
+			harborEyebrow.Text = "VOYAGE AT SEA · " .. seats .. " CREW"
 			harborEyebrow.TextColor3 = C.AccentSea
-			harborBody.Text = "Use the ship's wheel to join them. You'll be rowed out to the island."
+			harborBody.Text = "The ship's crew is at sea. Wait here: the next voyage takes a new crew."
 		elseif sailing then
-			harborEyebrow.Text = string.upper(string.format("The ship leaves in %s · %d in crew", clock(left), crewCount))
+			harborEyebrow.Text = string.upper(string.format("The ship leaves in %s · %s crew", clock(left), seats))
 			harborEyebrow.TextColor3 = if left <= 5 then C.StateWarning else C.AccentLighthouse
-			harborBody.Text = "Get to the ship's wheel to sail with them."
+			harborBody.Text = if full then "This crew is full. Wait here for the next voyage." else "Walk onto the ship to sail with them."
 		else
-			harborEyebrow.Text = "HARBOR ISLAND"
+			harborEyebrow.Text = "HARBOR ISLAND · SHIP " .. seats
 			harborEyebrow.TextColor3 = C.AccentLighthouse
-			harborBody.Text = "Walk the pier onto the ship and use the ship's wheel to join the crew. The Quartermaster sells gear by the path."
+			harborBody.Text = "Walk the pier onto the ship to join its crew (up to " .. capacity .. "). The Quartermaster sells gear by the path."
 		end
 	end
+
+	renderVoyageCrew(ready and RUN_PHASES[phase] == true, crew, seats)
 
 	-- crew card: you're in the crew and the ship hasn't sailed yet
 	local showCrew = ready and not underway and (sailing or phase == "Waiting") and not hidden
 	crewCard.Visible = showCrew
 	if showCrew then
-		crewEyebrow.Text = string.format("YOUR CREW · %d/%d", crewCount, state:GetAttribute("ShipCapacity") or 4) -- seats on this ship
+		crewEyebrow.Text = "YOUR CREW · " .. seats -- seats on this ship
 		crewHeadline.Text = if sailing then (if atHarbor then "Sailing in " else "Next storm in ") .. clock(left) else "Waiting to sail"
 		crewHeadline.TextColor3 = if sailing and left <= 5 then C.AccentLighthouseSoft else C.TextPrimary
 		for i, row in rosterRows do
@@ -366,8 +429,8 @@ local function render()
 		leaveLine.Visible = not compact
 		aboardLine.Visible = aboard > 0
 		aboardLine.Text = string.format("%d more on the harbor, not in the crew", aboard)
-		leaveLine.Text = if atHarbor
-			then string.format("Changed your mind? Use the ship's wheel again (%s) to leave the crew.", key)
+		leaveLine.Text = if player:GetAttribute("BoardedByDeck")
+			then "Changed your mind? Step off the ship to leave the crew."
 			else "Stay near the lighthouse. The next storm starts when the timer ends."
 	end
 end
@@ -386,8 +449,8 @@ local function layout()
 	local hw = math.min(if phone then 460 else 600, size.X - 24)
 	harbor.Size = UDim2.fromOffset(hw, if phone then 64 else 78)
 	harbor.Position = UDim2.new(0.5, 0, 0, if phone then 6 else 12)
-	local keyW = if phone then 0 else 96
-	harborKey.Visible = not phone
+	local keyW = 0 -- boarding batch: no key to press, you walk aboard
+	harborKey.Visible = false
 	harborKey.Position = UDim2.new(1, -10, 0.5, 0)
 	harborText.Position = UDim2.fromOffset(24, 4)
 	harborText.Size = UDim2.new(1, -24 - keyW - 16, 1, -8)
@@ -403,6 +466,9 @@ local function layout()
 	crewHeadline.TextSize = if phone then 18 else 22
 	roster.Visible = not phone or #crewList() <= 2
 	travelColumn.Size = UDim2.fromOffset(math.min(520, size.X - 32), 120)
+	-- voyage crew: left edge, above the phone thumbstick area
+	voyageCard.Size = UDim2.fromOffset(if phone then 150 else 190, 0)
+	voyageCard.Position = UDim2.new(0, if phone then 8 else 12, if phone then 0.36 else 0.4, 0)
 end
 root:GetPropertyChangedSignal("AbsoluteSize"):Connect(layout)
 layout()
@@ -428,7 +494,7 @@ remotes:WaitForChild("Travel").OnClientEvent:Connect(function()
 		travelSub.Text = if RUN_PHASES[phase] and phase ~= "Prologue" then "Rowing out to your crew. Keep the light alive." else "The storm is coming. Keep the light alive."
 	else
 		travelTitle.Text = "Harbor Island"
-		travelSub.Text = "Back at the ship. Use the wheel to sail again."
+		travelSub.Text = "Back at the harbor. Walk onto the ship to sail again."
 	end
 	fader.Visible = true
 	fader.BackgroundTransparency = 1

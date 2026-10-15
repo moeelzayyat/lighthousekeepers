@@ -563,7 +563,7 @@ local function refreshVoyage()
 	local timeLeft = state:GetAttribute("TimeLeft") or 0
 	local title, sub, showTimer = "", "", true
 	if phase == "Waiting" then
-		title, sub, showTimer = "WAITING FOR KEEPERS", "Join the crew at the ship's wheel", false
+		title, sub, showTimer = "WAITING FOR KEEPERS", "Walk onto the ship to join the crew", false
 	elseif phase == "Intermission" then
 		title, sub = "SETTING SAIL", "The crew is boarding"
 	elseif phase == "Prologue" then

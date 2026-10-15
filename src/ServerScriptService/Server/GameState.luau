@@ -330,7 +330,7 @@ function GameState.run(deps)
 		-- only for players ashore who haven't joined (the crew sees its own countdown card)
 		for _, p in Players:GetPlayers() do
 			if not p:GetAttribute("Ready") and p:GetAttribute("InLobby") then
-				deps.remotes.Notify:FireClient(p, string.format("The ship sails in %d seconds! Use the SHIP'S WHEEL to join the crew.", Config.INTERMISSION_SECONDS))
+				deps.remotes.Notify:FireClient(p, string.format("The ship sails in %d seconds! Walk onto the ship to join the crew.", Config.INTERMISSION_SECONDS))
 			end
 		end
 		if countdown(Config.INTERMISSION_SECONDS, noPlayers) then

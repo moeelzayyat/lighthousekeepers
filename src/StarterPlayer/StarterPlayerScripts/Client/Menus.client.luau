@@ -1143,7 +1143,7 @@ local function refreshNote()
 	local underway = phase == "Prologue" or phase == "Day" or phase == "Night"
 	note.Visible = underway
 	noteGap.Visible = underway
-	noteText.Text = "A voyage is already at sea. Press Play, then join the next crew at the ship's wheel."
+	noteText.Text = "A voyage is already at sea. Press Play, then walk onto the ship to join the next crew."
 	if current == "title" then
 		layoutTitle()
 	end

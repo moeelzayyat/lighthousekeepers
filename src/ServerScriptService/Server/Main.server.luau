@@ -23,6 +23,7 @@ local PlayerData = require(script.Parent.PlayerData)
 local ShopService = require(script.Parent.ShopService)
 local LoadoutService = require(script.Parent.LoadoutService)
 local ShipRoster = require(script.Parent.ShipRoster)
+local ShipBoarding = require(script.Parent.ShipBoarding)
 
 -- Shared state the HUD reads (attributes replicate to every client automatically)
 local stateFolder = Instance.new("Folder")
@@ -648,6 +649,20 @@ end)
 local SHIP_ID = "Ship1" -- the existing pirate ship
 ShipRoster.init(stateFolder, Config.MAX_CREW or 4, { SHIP_ID })
 
+-- Boarding batch: walking onto the ship joins its party (no button). The wheel prompt is switched off;
+-- the wheel keeps its sign, which shows this ship's seats.
+lobbyRefs.helmPrompt.Enabled = false
+ShipBoarding.init({
+	roster = ShipRoster,
+	ships = { [SHIP_ID] = lobbyRefs.folder:FindFirstChild("PirateShip") },
+	notify = LampService.notify,
+	log = EventLog.log,
+	mark = EventLog.mark,
+	canBoard = function(player)
+		return player:GetAttribute("InLobby") == true -- pressed Play (not on the title screen)
+	end,
+})
+
 -- Joining a ship's party at its wheel. Returns false if the party is full or the ship has sailed.
 local function joinCrew(player, via)
 	local ok, reason = ShipRoster.join(player, SHIP_ID)
@@ -715,7 +730,7 @@ local function chooseRoute(player)
 	EventLog.log("EnteredLobby", { player = player.Name, via = "first voyage" })
 	task.wait(0.4)
 	if player.Parent == Players and not player:GetAttribute("Ready") then
-		LampService.notify(player, "The storm is coming and the light needs keepers. Use the SHIP'S WHEEL to join the crew.")
+		LampService.notify(player, "The storm is coming and the light needs keepers. Walk onto the ship to join the crew.")
 	end
 end
 Players.PlayerAdded:Connect(function(player)
@@ -873,7 +888,9 @@ GameState.run({
 	remotes = remotes,
 	resetRound = resetRound,
 	departShip = function()
-		return ShipRoster.depart(SHIP_ID) -- freezes the party; only these players sail
+		local sailing = ShipRoster.depart(SHIP_ID) -- freezes the party; only these players sail
+		ShipBoarding.departed(sailing) -- their seats no longer depend on standing on the deck
+		return sailing
 	end,
 	lampVisuals = LampService.refreshVisuals,
 	autoSell = autoSellAtDawn,
