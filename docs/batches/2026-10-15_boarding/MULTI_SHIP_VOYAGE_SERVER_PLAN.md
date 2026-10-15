@@ -68,6 +68,9 @@ Status: proposal for owner and auditor review. Nothing here is built, published 
 5. **Save hand-over safety** (see above), reviewed by the auditor before step 6.
 6. Test the end-to-end flow in the test universe with 6 or more real clients (several ships, a failed teleport, a disconnect mid-teleport, a rematch, a return), then do a production rollout with the owner's approval.
 
+## Owner idea (2026-10-15): the ship sails away and a fresh one takes its place
+When a party departs, its ship sails off and disappears, and a new empty ship appears at the same berth, so the harbor is never blocked by a voyage at sea. This matches the voyage-server design: each departing ship becomes its own reserved voyage server, so the replacement ship can fill and leave at once, with no limit on how many voyages run at the same time. It needs the teleport architecture above. Inside one server a second voyage cannot run while the first is on the island, because there is one island and one game loop.
+
 ## Not decided (owner)
 - How many ships, where they sit in the harbor, and which island each one sails to.
 - Whether a party can choose its destination, or each ship goes to a fixed island.

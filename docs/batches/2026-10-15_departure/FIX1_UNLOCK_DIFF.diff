@@ -1,0 +1,19 @@
+diff --git a/src/ServerScriptService/Server/ShipRoster.luau b/src/ServerScriptService/Server/ShipRoster.luau
+index f003b5b..4aa3caf 100644
+--- a/src/ServerScriptService/Server/ShipRoster.luau
++++ b/src/ServerScriptService/Server/ShipRoster.luau
+@@ -65,9 +65,12 @@ function ShipRoster.init(stateFolder, capacity, shipIds)
+ 	Players.PlayerRemoving:Connect(function(player)
+ 		ShipRoster.leave(player, "disconnect")
+ 	end)
+-	-- back in port: every ship takes a new party
++	-- back in port: every ship takes a new party. Intermission counts too: after Play Again, GameState sets
++	-- Waiting and then Intermission in the same frame, and this (deferred) handler only sees Intermission.
++	-- A ship is never locked legitimately during Intermission (it locks when the countdown ends).
+ 	state:GetAttributeChangedSignal("Phase"):Connect(function()
+-		if state:GetAttribute("Phase") == "Waiting" then
++		local phase = state:GetAttribute("Phase")
++		if phase == "Waiting" or phase == "Intermission" then
+ 			for _, ship in ships do
+ 				ship.locked = false
+ 				publish(ship)
