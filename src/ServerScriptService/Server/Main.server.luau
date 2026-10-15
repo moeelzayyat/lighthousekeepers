@@ -25,6 +25,7 @@ local LoadoutService = require(script.Parent.LoadoutService)
 local ShipRoster = require(script.Parent.ShipRoster)
 local ShipBoarding = require(script.Parent.ShipBoarding)
 local ShipDeparture = require(script.Parent.ShipDeparture)
+local VoyageCast = require(script.Parent.VoyageCast)
 
 -- Shared state the HUD reads (attributes replicate to every client automatically)
 local stateFolder = Instance.new("Folder")
@@ -65,7 +66,7 @@ CreatureService.init(refs, LampService, TowerService, UpgradeService, DefenseSer
 LootService.init(refs.folder, UpgradeService, remotes, PlayerData)
 CreatureService.onKilled = LootService.dropFrom
 DefenseService.init(refs.folder, CreatureService, UpgradeService, function(text)
-	remotes.Notify:FireAllClients(text)
+	VoyageCast.fire(remotes.Notify, text) -- cannon news is for the voyage crew, not the harbor
 end, LampService.notify)
 
 -- Upgrade bench: open the upgrade panel for whoever uses it
@@ -142,7 +143,7 @@ remotes.BuyUpgrade.OnServerEvent:Connect(function(player, id, requestId)
 		if benchPart then
 			SoundFx.playAt("build", benchPart.Position)
 		end
-		remotes.Notify:FireAllClients(player.DisplayName .. ": " .. message)
+		VoyageCast.fire(remotes.Notify, player.DisplayName .. ": " .. message) -- island bench: crew only
 	elseif not requestId then
 		LampService.notify(player, message) -- the bench UI shows the reason itself
 	end
@@ -776,7 +777,7 @@ local function sellAllLoot(player)
 	end
 	UpgradeService.addShells(total)
 	SoundFx.playAt("build", refs.traderPrompt.Parent.Position)
-	remotes.Notify:FireAllClients(string.format("%s sold %s to the Trader for %d shells!", player.DisplayName, table.concat(parts, ", "), total))
+	VoyageCast.fire(remotes.Notify, string.format("%s sold %s to the Trader for %d shells!", player.DisplayName, table.concat(parts, ", "), total)) -- island Trader: crew only
 	EventLog.log("SoldLoot", { player = player.Name, shells = total })
 	EventLog.count("lootSold", total) -- for the results screen
 	return true, string.format("Sold for %d Shells.", total), total

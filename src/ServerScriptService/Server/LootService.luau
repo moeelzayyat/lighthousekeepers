@@ -15,6 +15,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
 local EventLog = require(script.Parent.EventLog)
+local VoyageCast = require(script.Parent.VoyageCast)
 local Ground = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Ground"))
 local Creatures = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Creatures"))
 
@@ -126,7 +127,7 @@ function LootService.dropFrom(position, kind)
 		if math.random() < Config.BOSS_PEARL_CHANCE then
 			spawnDrop("Pearls", math.random(Config.BOSS_PEARL_MIN, Config.BOSS_PEARL_MAX), position)
 		end
-		remotes.Notify:FireAllClients("The monster is down! Grab its loot!")
+		VoyageCast.fire(remotes.Notify, "The monster is down! Grab its loot!")
 		return
 	end
 	spawnDrop("Shells", math.random(Config.SHELLS_PER_CRAB_MIN, Config.SHELLS_PER_CRAB_MAX), position)
@@ -155,7 +156,7 @@ local function collect(index, player)
 		playerData.addPearls(player, drop.value, "boss drop")
 		EventLog.log("BossPearls", { player = player.Name, amount = drop.value })
 		remotes.LootCollected:FireClient(player, drop.kind, drop.value)
-		remotes.Notify:FireAllClients(string.format("%s picked up %d Pearls from the monster!", player.DisplayName, drop.value))
+		VoyageCast.fire(remotes.Notify, string.format("%s picked up %d Pearls from the monster!", player.DisplayName, drop.value))
 		removeAt(index)
 		return
 	end
@@ -172,9 +173,9 @@ local function collect(index, player)
 	end
 	remotes.LootCollected:FireClient(player, drop.kind, drop.value)
 	if drop.kind == "BlackPearl" then
-		remotes.Notify:FireAllClients(string.format("%s found %s!", player.DisplayName, info.name))
+		VoyageCast.fire(remotes.Notify, string.format("%s found %s!", player.DisplayName, info.name))
 	elseif drop.kind == "SeaGlass" then
-		remotes.Notify:FireAllClients(string.format("%s found %s!", player.DisplayName, info.name))
+		VoyageCast.fire(remotes.Notify, string.format("%s found %s!", player.DisplayName, info.name))
 	end
 	removeAt(index)
 end
@@ -218,7 +219,7 @@ function LootService.tideCollect(fraction)
 		upgrades.addShells(shells)
 		EventLog.loot("Tide", shells)
 		EventLog.log("TideLoot", { shells = shells, fullValue = total })
-		remotes.Notify:FireAllClients(string.format("The tide brought in %d shells from uncollected loot.", shells))
+		VoyageCast.fire(remotes.Notify, string.format("The tide brought in %d shells from uncollected loot.", shells))
 	end
 	return shells
 end

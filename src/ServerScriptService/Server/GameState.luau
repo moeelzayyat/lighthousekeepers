@@ -12,6 +12,7 @@ local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Co
 local Creatures = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Creatures"))
 local SoundFx = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SoundFx"))
 local EventLog = require(script.Parent.EventLog)
+local VoyageCast = require(script.Parent.VoyageCast)
 local Forecasts = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Forecasts"))
 
 local GameState = {}
@@ -82,8 +83,9 @@ function GameState.run(deps)
 	local upgrades = deps.upgrades
 	local state = deps.state
 
+	-- voyage announcements go to the voyage crew only, never to the harbor (multi-ship phase 1)
 	local function notifyAll(text)
-		deps.remotes.Notify:FireAllClients(text)
+		VoyageCast.fire(deps.remotes.Notify, text)
 	end
 
 	local function setPhase(phase, night)
@@ -551,7 +553,11 @@ function GameState.run(deps)
 				for _, player in voters do
 					player:SetAttribute("WantsRematch", false)
 				end
-				deps.remotes.RunResults:FireAllClients(results)
+				for _, player in voters do -- the results screen is for this voyage's crew only
+					if player.Parent then
+						deps.remotes.RunResults:FireClient(player, results)
+					end
+				end
 				EventLog.log("ResultsShown", { players = #voters })
 				EventLog.log("RematchOffered", { players = #voters })
 				countdown(Config.RESULT_SECONDS, function()

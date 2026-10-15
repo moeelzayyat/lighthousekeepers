@@ -1,0 +1,226 @@
+diff --git a/src/ReplicatedStorage/Shared/SoundFx.luau b/src/ReplicatedStorage/Shared/SoundFx.luau
+index 3621c22..c4adc6d 100644
+--- a/src/ReplicatedStorage/Shared/SoundFx.luau
++++ b/src/ReplicatedStorage/Shared/SoundFx.luau
+@@ -1,8 +1,8 @@
+ -- SoundFx: every gameplay sound effect in one place.
+ -- Change an ID, volume, or pitch here and it changes everywhere.
+ --
+---   SoundFx.playAt(name, position)  3D sound at a point. Called on the server, it tells every
+---                                  client to play it locally (reliable and costs the server nothing).
++--   SoundFx.playAt(name, position)  3D sound at a point. Called on the server, it tells every voyage crew
++--                                  member's client to play it locally (harbor players don't hear the island).
+ --   SoundFx.play2D(name, pitch)     sound only this player hears, no position (client only)
+ 
+ local Debris = game:GetService("Debris")
+@@ -109,7 +109,12 @@ end
+ 
+ function SoundFx.playAt(name, position)
+ 	if IS_SERVER then
+-		getRemote():FireAllClients(name, position)
++		-- every server-played sound is an island sound: only the voyage crew (Ready) hears it, not the harbor
++		for _, player in game:GetService("Players"):GetPlayers() do
++			if player:GetAttribute("Ready") == true then
++				getRemote():FireClient(player, name, position)
++			end
++		end
+ 	else
+ 		playLocalAt(name, position)
+ 	end
+diff --git a/src/ServerScriptService/Server/GameState.luau b/src/ServerScriptService/Server/GameState.luau
+index 0f30bf7..0cc268e 100644
+--- a/src/ServerScriptService/Server/GameState.luau
++++ b/src/ServerScriptService/Server/GameState.luau
+@@ -12,6 +12,7 @@ local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Co
+ local Creatures = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Creatures"))
+ local SoundFx = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SoundFx"))
+ local EventLog = require(script.Parent.EventLog)
++local VoyageCast = require(script.Parent.VoyageCast)
+ local Forecasts = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Forecasts"))
+ 
+ local GameState = {}
+@@ -82,8 +83,9 @@ function GameState.run(deps)
+ 	local upgrades = deps.upgrades
+ 	local state = deps.state
+ 
++	-- voyage announcements go to the voyage crew only, never to the harbor (multi-ship phase 1)
+ 	local function notifyAll(text)
+-		deps.remotes.Notify:FireAllClients(text)
++		VoyageCast.fire(deps.remotes.Notify, text)
+ 	end
+ 
+ 	local function setPhase(phase, night)
+@@ -551,7 +553,11 @@ function GameState.run(deps)
+ 				for _, player in voters do
+ 					player:SetAttribute("WantsRematch", false)
+ 				end
+-				deps.remotes.RunResults:FireAllClients(results)
++				for _, player in voters do -- the results screen is for this voyage's crew only
++					if player.Parent then
++						deps.remotes.RunResults:FireClient(player, results)
++					end
++				end
+ 				EventLog.log("ResultsShown", { players = #voters })
+ 				EventLog.log("RematchOffered", { players = #voters })
+ 				countdown(Config.RESULT_SECONDS, function()
+diff --git a/src/ServerScriptService/Server/LootService.luau b/src/ServerScriptService/Server/LootService.luau
+index c797bfb..9a22ac0 100644
+--- a/src/ServerScriptService/Server/LootService.luau
++++ b/src/ServerScriptService/Server/LootService.luau
+@@ -15,6 +15,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
+ 
+ local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+ local EventLog = require(script.Parent.EventLog)
++local VoyageCast = require(script.Parent.VoyageCast)
+ local Ground = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Ground"))
+ local Creatures = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Creatures"))
+ 
+@@ -126,7 +127,7 @@ function LootService.dropFrom(position, kind)
+ 		if math.random() < Config.BOSS_PEARL_CHANCE then
+ 			spawnDrop("Pearls", math.random(Config.BOSS_PEARL_MIN, Config.BOSS_PEARL_MAX), position)
+ 		end
+-		remotes.Notify:FireAllClients("The monster is down! Grab its loot!")
++		VoyageCast.fire(remotes.Notify, "The monster is down! Grab its loot!")
+ 		return
+ 	end
+ 	spawnDrop("Shells", math.random(Config.SHELLS_PER_CRAB_MIN, Config.SHELLS_PER_CRAB_MAX), position)
+@@ -155,7 +156,7 @@ local function collect(index, player)
+ 		playerData.addPearls(player, drop.value, "boss drop")
+ 		EventLog.log("BossPearls", { player = player.Name, amount = drop.value })
+ 		remotes.LootCollected:FireClient(player, drop.kind, drop.value)
+-		remotes.Notify:FireAllClients(string.format("%s picked up %d Pearls from the monster!", player.DisplayName, drop.value))
++		VoyageCast.fire(remotes.Notify, string.format("%s picked up %d Pearls from the monster!", player.DisplayName, drop.value))
+ 		removeAt(index)
+ 		return
+ 	end
+@@ -172,9 +173,9 @@ local function collect(index, player)
+ 	end
+ 	remotes.LootCollected:FireClient(player, drop.kind, drop.value)
+ 	if drop.kind == "BlackPearl" then
+-		remotes.Notify:FireAllClients(string.format("%s found %s!", player.DisplayName, info.name))
++		VoyageCast.fire(remotes.Notify, string.format("%s found %s!", player.DisplayName, info.name))
+ 	elseif drop.kind == "SeaGlass" then
+-		remotes.Notify:FireAllClients(string.format("%s found %s!", player.DisplayName, info.name))
++		VoyageCast.fire(remotes.Notify, string.format("%s found %s!", player.DisplayName, info.name))
+ 	end
+ 	removeAt(index)
+ end
+@@ -218,7 +219,7 @@ function LootService.tideCollect(fraction)
+ 		upgrades.addShells(shells)
+ 		EventLog.loot("Tide", shells)
+ 		EventLog.log("TideLoot", { shells = shells, fullValue = total })
+-		remotes.Notify:FireAllClients(string.format("The tide brought in %d shells from uncollected loot.", shells))
++		VoyageCast.fire(remotes.Notify, string.format("The tide brought in %d shells from uncollected loot.", shells))
+ 	end
+ 	return shells
+ end
+diff --git a/src/ServerScriptService/Server/Main.server.luau b/src/ServerScriptService/Server/Main.server.luau
+index 210e095..2a7cea8 100644
+--- a/src/ServerScriptService/Server/Main.server.luau
++++ b/src/ServerScriptService/Server/Main.server.luau
+@@ -25,6 +25,7 @@ local LoadoutService = require(script.Parent.LoadoutService)
+ local ShipRoster = require(script.Parent.ShipRoster)
+ local ShipBoarding = require(script.Parent.ShipBoarding)
+ local ShipDeparture = require(script.Parent.ShipDeparture)
++local VoyageCast = require(script.Parent.VoyageCast)
+ 
+ -- Shared state the HUD reads (attributes replicate to every client automatically)
+ local stateFolder = Instance.new("Folder")
+@@ -65,7 +66,7 @@ CreatureService.init(refs, LampService, TowerService, UpgradeService, DefenseSer
+ LootService.init(refs.folder, UpgradeService, remotes, PlayerData)
+ CreatureService.onKilled = LootService.dropFrom
+ DefenseService.init(refs.folder, CreatureService, UpgradeService, function(text)
+-	remotes.Notify:FireAllClients(text)
++	VoyageCast.fire(remotes.Notify, text) -- cannon news is for the voyage crew, not the harbor
+ end, LampService.notify)
+ 
+ -- Upgrade bench: open the upgrade panel for whoever uses it
+@@ -142,7 +143,7 @@ remotes.BuyUpgrade.OnServerEvent:Connect(function(player, id, requestId)
+ 		if benchPart then
+ 			SoundFx.playAt("build", benchPart.Position)
+ 		end
+-		remotes.Notify:FireAllClients(player.DisplayName .. ": " .. message)
++		VoyageCast.fire(remotes.Notify, player.DisplayName .. ": " .. message) -- island bench: crew only
+ 	elseif not requestId then
+ 		LampService.notify(player, message) -- the bench UI shows the reason itself
+ 	end
+@@ -776,7 +777,7 @@ local function sellAllLoot(player)
+ 	end
+ 	UpgradeService.addShells(total)
+ 	SoundFx.playAt("build", refs.traderPrompt.Parent.Position)
+-	remotes.Notify:FireAllClients(string.format("%s sold %s to the Trader for %d shells!", player.DisplayName, table.concat(parts, ", "), total))
++	VoyageCast.fire(remotes.Notify, string.format("%s sold %s to the Trader for %d shells!", player.DisplayName, table.concat(parts, ", "), total)) -- island Trader: crew only
+ 	EventLog.log("SoldLoot", { player = player.Name, shells = total })
+ 	EventLog.count("lootSold", total) -- for the results screen
+ 	return true, string.format("Sold for %d Shells.", total), total
+diff --git a/src/StarterPlayer/StarterPlayerScripts/Client/Storm.client.luau b/src/StarterPlayer/StarterPlayerScripts/Client/Storm.client.luau
+index 49663fb..5da788d 100644
+--- a/src/StarterPlayer/StarterPlayerScripts/Client/Storm.client.luau
++++ b/src/StarterPlayer/StarterPlayerScripts/Client/Storm.client.luau
+@@ -126,11 +126,13 @@ localPlayer:GetAttributeChangedSignal("LowEffects"):Connect(function()
+ 	setStorm(current)
+ end)
+ 
++-- the storm (rain, thunder) is on the lighthouse island: only the voyage crew is in it, not the harbor
+ local function refresh()
+ 	local phase = state:GetAttribute("Phase")
+-	setStorm(phase == "Night" or phase == "Prologue")
++	setStorm((phase == "Night" or phase == "Prologue") and localPlayer:GetAttribute("Ready") == true)
+ end
+ state:GetAttributeChangedSignal("Phase"):Connect(refresh)
++localPlayer:GetAttributeChangedSignal("Ready"):Connect(refresh)
+ refresh()
+ 
+ ---------------------------------------------------------------------
+@@ -156,6 +158,7 @@ task.spawn(function()
+ 		local focused = state:GetAttribute("BeamMode") == "focused"
+ 			and (state:GetAttribute("Fuel") or 0) > 0
+ 			and (state:GetAttribute("KeeperUserId") or 0) ~= 0
++			and localPlayer:GetAttribute("Ready") == true -- the island lamp is heard by the voyage crew only
+ 		if focused == on then
+ 			return
+ 		end
+@@ -178,6 +181,7 @@ task.spawn(function()
+ 	for _, attribute in { "BeamMode", "Fuel", "KeeperUserId" } do
+ 		state:GetAttributeChangedSignal(attribute):Connect(refresh)
+ 	end
++	localPlayer:GetAttributeChangedSignal("Ready"):Connect(refresh)
+ 	refresh()
+ end)
+ 
+diff --git a/src/ServerScriptService/Server/VoyageCast.luau b/src/ServerScriptService/Server/VoyageCast.luau
+new file mode 100644
+index 0000000..85bbd45
+--- /dev/null
++++ b/src/ServerScriptService/Server/VoyageCast.luau
+@@ -0,0 +1,30 @@
++-- VoyageCast (multi-ship phase 1): voyage messages go to the voyage crew only.
++--
++-- The island and the harbor share one server, so anything sent with FireAllClients also reaches the
++-- players waiting in the harbor. Lighthouse announcements, combat and loot news, cannon and Trader news,
++-- and the results screen are for the crew of the current voyage: the players with Ready = true (ShipRoster
++-- keeps Ready in step with the departed party; harbor spectators are never Ready during a voyage).
++-- Harbor messages keep using FireClient to the players they concern.
++
++local Players = game:GetService("Players")
++
++local VoyageCast = {}
++
++function VoyageCast.crew()
++	local list = {}
++	for _, player in Players:GetPlayers() do
++		if player:GetAttribute("Ready") == true then
++			table.insert(list, player)
++		end
++	end
++	return list
++end
++
++-- remote:FireClient(player, ...) for every crew member
++function VoyageCast.fire(remote, ...)
++	for _, player in VoyageCast.crew() do
++		remote:FireClient(player, ...)
++	end
++end
++
++return VoyageCast

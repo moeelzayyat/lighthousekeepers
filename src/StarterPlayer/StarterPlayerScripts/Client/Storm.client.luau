@@ -126,11 +126,13 @@ localPlayer:GetAttributeChangedSignal("LowEffects"):Connect(function()
 	setStorm(current)
 end)
 
+-- the storm (rain, thunder) is on the lighthouse island: only the voyage crew is in it, not the harbor
 local function refresh()
 	local phase = state:GetAttribute("Phase")
-	setStorm(phase == "Night" or phase == "Prologue")
+	setStorm((phase == "Night" or phase == "Prologue") and localPlayer:GetAttribute("Ready") == true)
 end
 state:GetAttributeChangedSignal("Phase"):Connect(refresh)
+localPlayer:GetAttributeChangedSignal("Ready"):Connect(refresh)
 refresh()
 
 ---------------------------------------------------------------------
@@ -156,6 +158,7 @@ task.spawn(function()
 		local focused = state:GetAttribute("BeamMode") == "focused"
 			and (state:GetAttribute("Fuel") or 0) > 0
 			and (state:GetAttribute("KeeperUserId") or 0) ~= 0
+			and localPlayer:GetAttribute("Ready") == true -- the island lamp is heard by the voyage crew only
 		if focused == on then
 			return
 		end
@@ -178,6 +181,7 @@ task.spawn(function()
 	for _, attribute in { "BeamMode", "Fuel", "KeeperUserId" } do
 		state:GetAttributeChangedSignal(attribute):Connect(refresh)
 	end
+	localPlayer:GetAttributeChangedSignal("Ready"):Connect(refresh)
 	refresh()
 end)
 

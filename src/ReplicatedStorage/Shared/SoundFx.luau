@@ -1,8 +1,8 @@
 -- SoundFx: every gameplay sound effect in one place.
 -- Change an ID, volume, or pitch here and it changes everywhere.
 --
---   SoundFx.playAt(name, position)  3D sound at a point. Called on the server, it tells every
---                                  client to play it locally (reliable and costs the server nothing).
+--   SoundFx.playAt(name, position)  3D sound at a point. Called on the server, it tells every voyage crew
+--                                  member's client to play it locally (harbor players don't hear the island).
 --   SoundFx.play2D(name, pitch)     sound only this player hears, no position (client only)
 
 local Debris = game:GetService("Debris")
@@ -109,7 +109,12 @@ end
 
 function SoundFx.playAt(name, position)
 	if IS_SERVER then
-		getRemote():FireAllClients(name, position)
+		-- every server-played sound is an island sound: only the voyage crew (Ready) hears it, not the harbor
+		for _, player in game:GetService("Players"):GetPlayers() do
+			if player:GetAttribute("Ready") == true then
+				getRemote():FireClient(player, name, position)
+			end
+		end
 	else
 		playLocalAt(name, position)
 	end
