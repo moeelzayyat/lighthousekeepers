@@ -24,6 +24,7 @@ local ShopService = require(script.Parent.ShopService)
 local LoadoutService = require(script.Parent.LoadoutService)
 local ShipRoster = require(script.Parent.ShipRoster)
 local ShipBoarding = require(script.Parent.ShipBoarding)
+local ShipDeparture = require(script.Parent.ShipDeparture)
 
 -- Shared state the HUD reads (attributes replicate to every client automatically)
 local stateFolder = Instance.new("Folder")
@@ -649,12 +650,12 @@ end)
 local SHIP_ID = "Ship1" -- the existing pirate ship
 ShipRoster.init(stateFolder, Config.MAX_CREW or 4, { SHIP_ID })
 
--- Boarding batch: walking onto the ship joins its party (no button). The wheel prompt is switched off;
--- the wheel keeps its sign, which shows this ship's seats.
-lobbyRefs.helmPrompt.Enabled = false
+-- Boarding batch: standing in the ship's BoardingZone joins its party (no button).
+-- Departure revision: boarding never starts a departure. ShipDeparture does: automatically at 4/4, or when a
+-- crew member of a party of 1 to 3 uses SAIL NOW at the ship's wheel.
 ShipBoarding.init({
 	roster = ShipRoster,
-	ships = { [SHIP_ID] = lobbyRefs.folder:FindFirstChild("PirateShip") },
+	zones = { [SHIP_ID] = lobbyRefs.boardingZone },
 	notify = LampService.notify,
 	log = EventLog.log,
 	mark = EventLog.mark,
@@ -662,36 +663,30 @@ ShipBoarding.init({
 		return player:GetAttribute("InLobby") == true -- pressed Play (not on the title screen)
 	end,
 })
+ShipDeparture.init({
+	roster = ShipRoster,
+	state = stateFolder,
+	shipIds = { SHIP_ID },
+	notify = LampService.notify,
+	log = EventLog.log,
+})
 
--- Joining a ship's party at its wheel. Returns false if the party is full or the ship has sailed.
-local function joinCrew(player, via)
-	local ok, reason = ShipRoster.join(player, SHIP_ID)
-	if not ok then
-		LampService.notify(player, if reason == "full"
-			then string.format("This ship's crew is full (%d of %d). Wait on deck: you can join the next voyage.", ShipRoster.CAPACITY, ShipRoster.CAPACITY)
-			else "The ship has sailed with its crew. Wait on deck for the next voyage.")
-		EventLog.log("CrewRefused", { player = player.Name, via = via, reason = reason, ship = SHIP_ID })
-		return false
-	end
-	if reason == "joined" then
-		EventLog.log("PlayerReady", { player = player.Name, via = via, ship = SHIP_ID })
-		EventLog.mark(player, "crew")
-		LampService.notify(player, "You joined the crew! The ship sets sail soon.")
-	end
-	return true
-end
-
--- The ship's wheel: join or leave this ship's party
+-- The ship's wheel: SAIL NOW for a party of 1 to 3 (a full party departs automatically). The server checks
+-- everything; the client only shows the prompt to members who can use it.
+local SAIL_REFUSED = {
+	["not crew"] = "Walk onto the ship to join its crew first.",
+	sailed = "The ship is at sea with its crew. Wait here for the next voyage.",
+	already = "The ship is already preparing to sail.",
+	full = "The crew is full: the ship sails automatically.",
+}
 lobbyRefs.helmPrompt.Triggered:Connect(function(player)
 	if not player:GetAttribute("InLobby") then
 		return
 	end
-	if ShipRoster.shipOf(player) == SHIP_ID then
-		ShipRoster.leave(player, "wheel")
-		LampService.notify(player, "You left the crew. Use the wheel again to rejoin.")
-		EventLog.log("LeftCrew", { player = player.Name, ship = SHIP_ID })
-	else
-		joinCrew(player, "wheel")
+	local ok, reason = ShipDeparture.sailNow(player, SHIP_ID)
+	if not ok then
+		LampService.notify(player, SAIL_REFUSED[reason] or "You can't sail right now.")
+		EventLog.log("SailNowRefused", { player = player.Name, reason = reason, ship = SHIP_ID })
 	end
 end)
 
@@ -887,9 +882,18 @@ GameState.run({
 	state = stateFolder,
 	remotes = remotes,
 	resetRound = resetRound,
+	departure = {
+		requested = function()
+			return ShipDeparture.requested(SHIP_ID)
+		end,
+		rematch = function()
+			ShipDeparture.rematch(SHIP_ID)
+		end,
+	},
 	departShip = function()
 		local sailing = ShipRoster.depart(SHIP_ID) -- freezes the party; only these players sail
 		ShipBoarding.departed(sailing) -- their seats no longer depend on standing on the deck
+		ShipDeparture.departed(SHIP_ID) -- the departure request is used up
 		return sailing
 	end,
 	lampVisuals = LampService.refreshVisuals,

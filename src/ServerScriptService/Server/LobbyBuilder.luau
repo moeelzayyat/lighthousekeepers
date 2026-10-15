@@ -127,9 +127,10 @@ function LobbyBuilder.build(islandRefs)
 		local ring = makePart("Wheel", Vector3.new(0.4, 4, 4), CFrame.new(back + Vector3.new(0, 3.6, 0)) * facing.Rotation * CFrame.new(0, 0, -0.7) * CFrame.Angles(0, math.rad(90), 0), Color3.fromRGB(150, 105, 60), Enum.Material.Wood, lobby)
 		ring.Shape = Enum.PartType.Cylinder
 	end
+	-- Departure revision: the wheel is the crew's SAIL NOW (1 to 3 aboard); boarding is by the BoardingZone
 	local helmPrompt = Instance.new("ProximityPrompt")
 	helmPrompt.Name = "HelmPrompt"
-	helmPrompt.ActionText = "Join the crew"
+	helmPrompt.ActionText = "Sail now"
 	helmPrompt.ObjectText = "Ship's Wheel"
 	helmPrompt.KeyboardKeyCode = Enum.KeyCode.E
 	helmPrompt.GamepadKeyCode = Enum.KeyCode.ButtonX
@@ -138,6 +139,37 @@ function LobbyBuilder.build(islandRefs)
 	helmPrompt.RequiresLineOfSight = false
 	helmPrompt.Parent = wheel
 	-- (the wheel's departure sign is drawn per player by Client.Departure since UI Stage 6)
+
+	-- BoardingZone (departure revision): an invisible box over the ship's walkable decks only (the parts
+	-- named "...Floor" or "Deck"), from just under the lowest deck to 8 studs above the highest. Standing
+	-- in it is what puts a player in this ship's party; the pier, the water and the shore are outside it.
+	local lo, hi = Vector3.new(math.huge, math.huge, math.huge), Vector3.new(-math.huge, -math.huge, -math.huge)
+	for _, part in ship:GetDescendants() do
+		if part:IsA("BasePart") and (part.Name:find("Floor") or part.Name == "Deck") then
+			local h = part.Size / 2
+			for _, c in { Vector3.new(1, 1, 1), Vector3.new(1, 1, -1), Vector3.new(1, -1, 1), Vector3.new(1, -1, -1), Vector3.new(-1, 1, 1), Vector3.new(-1, 1, -1), Vector3.new(-1, -1, 1), Vector3.new(-1, -1, -1) } do
+				local v = facing:PointToObjectSpace(part.CFrame:PointToWorldSpace(h * c))
+				lo = lo:Min(v)
+				hi = hi:Max(v)
+			end
+		end
+	end
+	if lo.X == math.huge then -- no named floors: fall back to the deck around the ship's middle
+		lo, hi = facing:PointToObjectSpace(middle) - Vector3.new(10, 1, 30), facing:PointToObjectSpace(middle) + Vector3.new(10, 0, 30)
+	end
+	hi += Vector3.new(0, 8, 0)
+	local boardingZone = Instance.new("Part")
+	boardingZone.Name = "BoardingZone"
+	boardingZone.Anchored = true
+	boardingZone.CanCollide = false
+	boardingZone.CanQuery = false
+	boardingZone.CanTouch = false
+	boardingZone.CastShadow = false
+	boardingZone.Transparency = 1
+	boardingZone.Size = hi - lo
+	boardingZone.CFrame = facing * CFrame.new((lo + hi) / 2)
+	boardingZone:SetAttribute("ShipId", "Ship1")
+	boardingZone.Parent = lobby
 
 	-- The Quartermaster's market stall stands on the lobby island beside the path to the pier,
 	-- its counter facing the path, the Quartermaster behind it.
@@ -179,6 +211,7 @@ function LobbyBuilder.build(islandRefs)
 		folder = lobby,
 		spawn = spawn,
 		helmPrompt = helmPrompt,
+		boardingZone = boardingZone,
 		islandArrival = arrival,
 		deckCenter = middle,
 	}

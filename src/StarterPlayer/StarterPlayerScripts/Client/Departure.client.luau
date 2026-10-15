@@ -1,5 +1,7 @@
 -- Departure (client): boarding a ship's crew and sailing to the lighthouse.
--- Boarding batch: walking onto the ship joins its party (the server decides); the wheel prompt is off.
+-- Boarding batch: walking onto the ship joins its party (the server decides).
+-- Departure revision: a full crew (4/4) departs automatically; a crew of 1 to 3 waits until a member uses
+-- SAIL NOW at the ship's wheel (the prompt is shown only to crew members who can use it).
 --
 -- Mostly world-integrated, no big menu:
 --   * the SHIP'S WHEEL sign (a billboard on the wheel) shows the departure state to everyone nearby
@@ -345,24 +347,34 @@ local function render()
 	local capacity = state:GetAttribute("ShipCapacity") or 4
 	local seats = string.format("%d/%d", crewCount, capacity)
 	local full = crewCount >= capacity
+	local shipId = shownShip()
+	local departure = state:GetAttribute("Ship_" .. shipId .. "_Departure") -- "auto" | "manual" | "rematch" | nil
+	local leaving = sailing and departure ~= nil
 	if wheelSign then
 		if underway then
 			signState.Text = "AT SEA"
 			signDetail.Text = seats .. " crew · next voyage soon"
 			signState.TextColor3 = C.AccentSea
-		elseif full then
-			signState.Text = "CREW FULL " .. seats
-			signDetail.Text = if sailing then "Leaving in " .. clock(left) else "Find another ship"
-			signState.TextColor3 = C.StateWarning
-		elseif sailing then
+		elseif leaving then
 			signState.Text = "LEAVING IN " .. clock(left)
-			signDetail.Text = seats .. " crew · walk aboard to join"
+			signDetail.Text = if full then seats .. " crew · crew full" elseif departure == "manual" then seats .. " crew · SAIL NOW called" else seats .. " crew · walk aboard to join"
 			signState.TextColor3 = if left <= 5 then C.StateWarning else C.AccentLighthouse
+		elseif crewCount == 0 then
+			signState.Text = "WAITING FOR CREW"
+			signDetail.Text = "0/" .. capacity .. " · walk aboard to join"
+			signState.TextColor3 = C.AccentLighthouse
 		else
 			signState.Text = "CREW " .. seats
-			signDetail.Text = "Walk aboard to join"
+			signDetail.Text = "Waiting for crew · SAIL NOW at the wheel"
 			signState.TextColor3 = C.AccentLighthouse
 		end
+	end
+	-- SAIL NOW: only a member of this ship's party of 1 to 3, in port, before any departure has started
+	-- (local visibility only; the server checks every press)
+	if helmPrompt then
+		helmPrompt.Enabled = ready and player:GetAttribute("ShipId") == shipId and crewCount >= 1 and crewCount < capacity
+			and departure == nil and phase == "Waiting"
+		helmPrompt.ActionText = string.format("Sail now (%s)", seats)
 	end
 
 	local hidden = player:GetAttribute("MenuOpen") == true
@@ -382,12 +394,12 @@ local function render()
 			harborEyebrow.Text = "VOYAGE AT SEA · " .. seats .. " CREW"
 			harborEyebrow.TextColor3 = C.AccentSea
 			harborBody.Text = "The ship's crew is at sea. Wait here: the next voyage takes a new crew."
-		elseif sailing then
+		elseif leaving then
 			harborEyebrow.Text = string.upper(string.format("The ship leaves in %s · %s crew", clock(left), seats))
 			harborEyebrow.TextColor3 = if left <= 5 then C.StateWarning else C.AccentLighthouse
 			harborBody.Text = if full then "This crew is full. Wait here for the next voyage." else "Walk onto the ship to sail with them."
 		else
-			harborEyebrow.Text = "HARBOR ISLAND · SHIP " .. seats
+			harborEyebrow.Text = (if crewCount == 0 then "HARBOR ISLAND · WAITING FOR CREW " else "HARBOR ISLAND · SHIP ") .. seats
 			harborEyebrow.TextColor3 = C.AccentLighthouse
 			harborBody.Text = "Walk the pier onto the ship to join its crew (up to " .. capacity .. "). The Quartermaster sells gear by the path."
 		end
@@ -400,8 +412,8 @@ local function render()
 	crewCard.Visible = showCrew
 	if showCrew then
 		crewEyebrow.Text = "YOUR CREW · " .. seats -- seats on this ship
-		crewHeadline.Text = if sailing then (if atHarbor then "Sailing in " else "Next storm in ") .. clock(left) else "Waiting to sail"
-		crewHeadline.TextColor3 = if sailing and left <= 5 then C.AccentLighthouseSoft else C.TextPrimary
+		crewHeadline.Text = if leaving then (if atHarbor then "Sailing in " else "Next storm in ") .. clock(left) else "Waiting for crew"
+		crewHeadline.TextColor3 = if leaving and left <= 5 then C.AccentLighthouseSoft else C.TextPrimary
 		for i, row in rosterRows do
 			local p = crew[i]
 			if i <= MAX_ROSTER and p then
@@ -429,9 +441,11 @@ local function render()
 		leaveLine.Visible = not compact
 		aboardLine.Visible = aboard > 0
 		aboardLine.Text = string.format("%d more on the harbor, not in the crew", aboard)
-		leaveLine.Text = if player:GetAttribute("BoardedByDeck")
-			then "Changed your mind? Step off the ship to leave the crew."
-			else "Stay near the lighthouse. The next storm starts when the timer ends."
+		local onDeck = player:GetAttribute("BoardedByDeck") == true
+		leaveLine.Text = if not onDeck then "Stay near the lighthouse. The next storm starts when the timer ends."
+			elseif leaving and departure == "manual" then "SAIL NOW was called. Step off the ship to stay behind."
+			elseif leaving then "The crew is full. Step off the ship to stay behind."
+			else string.format("The ship sails when 4 are aboard, or use SAIL NOW at the ship's wheel (%s). Step off to leave the crew.", key)
 	end
 end
 

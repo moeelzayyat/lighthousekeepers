@@ -1,7 +1,9 @@
 -- ShipBoarding (boarding batch): automatic party membership by standing on a departure ship.
 --
 -- A player who has pressed Play (InLobby) and walks onto a ship's boarding zone joins that ship's party
--- through ShipRoster (the only place crew membership is decided). The zone is the ship model's bounding box.
+-- through ShipRoster (the only place crew membership is decided). The zone is the ship's invisible BoardingZone
+-- part (LobbyBuilder: the walkable decks only, so the pier and the shore never count).
+-- Boarding never starts a departure; ShipDeparture decides that (4/4 automatic, or SAIL NOW for 1 to 3).
 --   * seats fill in arrival order up to ShipRoster.CAPACITY; anyone after that is told the crew is full
 --     and stays free to explore or board another ship
 --   * stepping off the ship before departure frees the seat (after a short grace, so a stumble at the
@@ -21,7 +23,6 @@ local ShipBoarding = {}
 
 local POLL = 0.25
 local LEAVE_GRACE = 1.0 -- seconds off the ship before a deck seat is released
-local HEADROOM = 6 -- studs above the model's bounding box that still count (jumping on the deck)
 
 local zones = {} -- shipId -> { cframe, half }
 local offSince = {} -- player -> os.clock() when they left the zone they boarded through
@@ -30,7 +31,7 @@ local inZone = {} -- player -> shipId (last poll)
 local function zoneOf(position)
 	for shipId, zone in zones do
 		local p = zone.cframe:PointToObjectSpace(position)
-		if math.abs(p.X) <= zone.half.X and math.abs(p.Z) <= zone.half.Z and p.Y >= -zone.half.Y and p.Y <= zone.half.Y + HEADROOM then
+		if math.abs(p.X) <= zone.half.X and math.abs(p.Z) <= zone.half.Z and math.abs(p.Y) <= zone.half.Y then
 			return shipId
 		end
 	end
@@ -47,12 +48,12 @@ local function rootOf(player)
 	return root
 end
 
--- deps: roster (ShipRoster), ships = { [shipId] = model }, notify(player, text), log(kind, data), canBoard(player) -> bool
+-- deps: roster (ShipRoster), zones = { [shipId] = BoardingZone part }, notify(player, text), log(kind, data),
+-- canBoard(player) -> bool
 function ShipBoarding.init(deps)
 	local roster = deps.roster
-	for shipId, model in deps.ships do
-		local cframe, size = model:GetBoundingBox()
-		zones[shipId] = { cframe = cframe, half = size / 2 }
+	for shipId, part in deps.zones do
+		zones[shipId] = { cframe = part.CFrame, half = part.Size / 2 }
 	end
 
 	local function refuse(player, shipId, reason, entered)
@@ -107,7 +108,10 @@ function ShipBoarding.init(deps)
 			player:SetAttribute("BoardRefused", nil)
 			if reason == "joined" then
 				player:SetAttribute("BoardedByDeck", true)
-				deps.notify(player, string.format("You're in the crew (%d of %d). Stay aboard: the ship sets sail soon. Step off to leave.", #roster.members(here), roster.CAPACITY))
+				local n = #roster.members(here)
+				deps.notify(player, if n >= roster.CAPACITY
+					then string.format("You're in the crew (%d of %d). The crew is full: the ship is preparing to sail.", n, roster.CAPACITY)
+					else string.format("You're in the crew (%d of %d). Waiting for crew: use SAIL NOW at the wheel to leave sooner. Step off to leave the crew.", n, roster.CAPACITY))
 				deps.log("PlayerReady", { player = player.Name, via = "deck", ship = here })
 				if deps.mark then
 					deps.mark(player, "crew")

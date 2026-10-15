@@ -112,6 +112,18 @@ function GameState.run(deps)
 		return #readyPlayers() == 0
 	end
 
+	-- Departure revision: a crew in the harbor no longer starts the countdown just by existing. The ship
+	-- leaves only when ShipDeparture has a departure request (4/4 automatic, SAIL NOW, or Play Again).
+	local function departureRequested()
+		if deps.departure then
+			return deps.departure.requested()
+		end
+		return not noPlayers()
+	end
+	local function departureCancelled()
+		return not departureRequested()
+	end
+
 	-- Waits until condition() is true. Returns false if everyone left first.
 	local function waitUntil(condition)
 		while not condition() do
@@ -322,8 +334,8 @@ function GameState.run(deps)
 		state:SetAttribute("Reason", "")
 		state:SetAttribute("Cause", "")
 		offerForecasts()
-		while noPlayers() do
-			task.wait(1)
+		while not departureRequested() do
+			task.wait(0.25)
 		end
 
 		setPhase("Intermission", 0)
@@ -333,9 +345,14 @@ function GameState.run(deps)
 				deps.remotes.Notify:FireClient(p, string.format("The ship sails in %d seconds! Walk onto the ship to join the crew.", Config.INTERMISSION_SECONDS))
 			end
 		end
-		if countdown(Config.INTERMISSION_SECONDS, noPlayers) then
-			-- Departure (batch 1 revision): the ship's party is frozen here and only those players sail
-			local departing = if deps.departShip then deps.departShip() else readyPlayers()
+		-- Departure (batch 1 revision): the ship's party is frozen here and only those players sail.
+		-- Departure revision: the countdown is cancelled when the request is withdrawn (4/4 dropped to 3, the
+		-- SAIL NOW player left, the party emptied), and an empty snapshot never starts a voyage.
+		local departing = {}
+		if countdown(Config.INTERMISSION_SECONDS, departureCancelled) then
+			departing = if deps.departShip then deps.departShip() else readyPlayers()
+		end
+		if #departing > 0 then
 			deps.resetRound()
 			local forecast, votesA, votesB = chooseForecast(departing)
 			EventLog.startRun(departing)
@@ -557,6 +574,9 @@ function GameState.run(deps)
 					end
 				end
 				EventLog.log("Rematch", { playAgain = again, of = #voters })
+				if again > 0 and deps.departure then
+					deps.departure.rematch() -- Play Again is a deliberate departure for the crew that chose it
+				end
 			else
 				task.wait(3)
 			end
