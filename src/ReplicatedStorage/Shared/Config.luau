@@ -193,7 +193,7 @@ end
 Config.MULTISHIP_TEST = {
 	gameId = 10771229467, -- "LK Multiship Test" (created by the owner 2026-10-16; verified in Studio)
 	harborPlaceId = 125998212495899, -- its Harbor (start) place
-	islePlaceId = 0, -- its Lighthouse Isle place
+	islePlaceId = 111423375237885, -- its Lighthouse Isle place (verified via GetGamePlacesAsync)
 	multiShip = false, -- two ships in the harbor (Studio-safe; departures are simulated while teleport is off)
 	sessionLock = false, -- PlayerData uses SessionLock on the TEST store (real DataStore writes: owner approval)
 	teleport = false, -- real voyages to reserved Isle servers (owner approval)
