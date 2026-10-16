@@ -191,8 +191,8 @@ end
 -- this code runs in that experience (GameId match). In production Lighthouse Keepers the GameId never matches, so
 -- these switches can never turn anything on there. Each switch also needs the owner's go-ahead before it is set.
 Config.MULTISHIP_TEST = {
-	gameId = 0, -- the test experience's GameId (0 until the owner creates it)
-	harborPlaceId = 0, -- its Harbor (start) place
+	gameId = 10771229467, -- "LK Multiship Test" (created by the owner 2026-10-16; verified in Studio)
+	harborPlaceId = 125998212495899, -- its Harbor (start) place
 	islePlaceId = 0, -- its Lighthouse Isle place
 	multiShip = false, -- two ships in the harbor (Studio-safe; departures are simulated while teleport is off)
 	sessionLock = false, -- PlayerData uses SessionLock on the TEST store (real DataStore writes: owner approval)
