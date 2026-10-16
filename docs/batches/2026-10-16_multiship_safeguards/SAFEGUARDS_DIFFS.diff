@@ -1,0 +1,195 @@
+diff --git a/src/ServerScriptService/Server/HarborDepartures.luau b/src/ServerScriptService/Server/HarborDepartures.luau
+index 797eb09..310b4a8 100644
+--- a/src/ServerScriptService/Server/HarborDepartures.luau
++++ b/src/ServerScriptService/Server/HarborDepartures.luau
+@@ -8,6 +8,8 @@
+ --     snapshot, and deps.launch(shipId, crew) takes the crew away (teleport, or a Studio simulation)
+ --   * the ship takes a new party (ShipRoster.unlock) once launch() returns, errors, or exceeds LAUNCH_TIMEOUT
+ --     (fix 3, 2026-10-16): a teleport problem can never leave a ship locked for good
++--   * every launch gets its own ticket; on timeout the ticket is cancelled, so that launch can never go on to
++--     teleport its (old) crew later, even after a new crew has boarded the same ship (2026-10-16)
+ --
+ -- Replicated on the GameState folder for the client, per ship:
+ --   Ship_<id>_Phase    = "Waiting" | "Countdown" | "Sailing"
+@@ -54,8 +56,9 @@ function HarborDepartures.start(deps)
+ 				if #crew > 0 then
+ 					publish(shipId, "Sailing", 0)
+ 					local finished = false
++					local ticket = { cancelled = false } -- this voyage only
+ 					task.spawn(function()
+-						local ok, err = pcall(deps.launch, shipId, crew)
++						local ok, err = pcall(deps.launch, shipId, crew, ticket)
+ 						if not ok then
+ 							warn("[HarborDepartures] launch failed for " .. shipId .. ": " .. tostring(err))
+ 							deps.log("LaunchFailed", { ship = shipId, err = tostring(err) })
+@@ -67,6 +70,7 @@ function HarborDepartures.start(deps)
+ 						task.wait(POLL)
+ 					end
+ 					if not finished then
++						ticket.cancelled = true -- the late launch must recover its crew, not teleport them
+ 						deps.log("LaunchTimeout", { ship = shipId })
+ 					end
+ 				end
+diff --git a/src/ServerScriptService/Server/Voyages.luau b/src/ServerScriptService/Server/Voyages.luau
+index dd30970..49d7d0f 100644
+--- a/src/ServerScriptService/Server/Voyages.luau
++++ b/src/ServerScriptService/Server/Voyages.luau
+@@ -18,6 +18,15 @@
+ --   Failure at any step (fix 3, 2026-10-16): the member stays in the harbor, is NOT put back into a party (the ship
+ --   may already have a new crew; they can board again), and must RE-CLAIM their save session before playing on.
+ --   If the re-claim fails they are disconnected with a message, so they rejoin and load their saved progress fresh.
++--
++-- Live-activation safeguards (2026-10-16):
++--   * Every launch carries a TICKET from HarborDepartures. When the harbor gives up on a launch (timeout) it cancels
++--     the ticket; the launch checks it before every irreversible step (reserve, manifest, teleport) and, once
++--     cancelled, recovers its crew instead of teleporting them. A timed-out launch can never teleport an old crew.
++--   * Every save-adapter call (handoff, reclaim) is protected: an exception counts as a failure, so the player is
++--     recovered (re-claim, or disconnect to rejoin) and never left InTransit.
++--   * A teleport that was requested but never completed (no TeleportInitFailed, player still here) is recovered by a
++--     watchdog after TRANSIT_TIMEOUT seconds.
+ 
+ local Players = game:GetService("Players")
+ local ReplicatedStorage = game:GetService("ReplicatedStorage")
+@@ -28,6 +37,7 @@ local Voyages = {}
+ 
+ local MANIFEST_MAP = "Voyages"
+ local MANIFEST_SECONDS = 600
++local TRANSIT_TIMEOUT = 60 -- seconds after a teleport request before a still-present traveller is recovered
+ 
+ local deps = nil
+ 
+@@ -75,6 +85,20 @@ function Voyages.init(d)
+ 	end
+ end
+ 
++-- adapter calls never throw out of Voyages: an exception is a failure
++local function safeCall(fn, player)
++	local ok, result = pcall(fn, player)
++	if not ok then
++		deps.log("SaveAdapterError", { player = player.Name, err = tostring(result) })
++		return false
++	end
++	return result == true
++end
++
++local function cancelled(ticket)
++	return ticket ~= nil and ticket.cancelled == true
++end
++
+ local function simulate(shipId, crew)
+ 	deps.log("VoyageLaunched", { ship = shipId, crew = #crew, mode = "simulated" })
+ 	for _, player in crew do
+@@ -85,7 +109,7 @@ local function simulate(shipId, crew)
+ end
+ 
+ -- the real flow (also driven directly by the tests with fake services)
+-function Voyages._teleport(shipId, crew)
++function Voyages._teleport(shipId, crew, ticket)
+ 	assert(Config.ISLE_PLACE_ID ~= 0 or deps.services.testPlaceId, "ISLE_PLACE_ID is not set")
+ 	-- never move a player between servers without the guarded save hand-off
+ 	assert(deps.playerData and deps.playerData.handoff and deps.playerData.reclaim, "save hand-off adapter not wired: refusing to teleport")
+@@ -95,16 +119,31 @@ function Voyages._teleport(shipId, crew)
+ 	for _, player in crew do
+ 		player:SetAttribute("InTransit", true)
+ 		deps.roster.leave(player, "travelling")
++		-- watchdog from the very start: a hand-off or teleport step that hangs can never strand a player
++		task.delay(deps.transitTimeout or TRANSIT_TIMEOUT, function()
++			if player.Parent == Players and player:GetAttribute("InTransit") then
++				Voyages.teleportFailed(player, "voyage did not complete in time")
++			end
++		end)
+ 	end
+ 	-- 2. awaited hand-off of every save; only successful members travel
+ 	local travelling = {}
+ 	for _, player in crew do
+-		if player.Parent == Players and deps.playerData.handoff(player) then
++		if cancelled(ticket) then
++			Voyages.teleportFailed(player, "launch cancelled")
++		elseif player.Parent == Players and safeCall(deps.playerData.handoff, player) then
+ 			table.insert(travelling, player)
+ 		else
+ 			Voyages.teleportFailed(player, "save hand-off failed")
+ 		end
+ 	end
++	if cancelled(ticket) then -- timed out during the hand-offs: nobody travels on this launch
++		for _, player in travelling do
++			Voyages.teleportFailed(player, "launch cancelled")
++		end
++		deps.log("VoyageCancelled", { ship = shipId, why = "launch timed out" })
++		return
++	end
+ 	if #travelling == 0 then
+ 		deps.log("VoyageCancelled", { ship = shipId, why = "no traveller handed off" })
+ 		return
+@@ -112,15 +151,27 @@ function Voyages._teleport(shipId, crew)
+ 	-- 3-5. reserve, manifest of exactly the travellers, teleport
+ 	local ok, err = pcall(function()
+ 		local code, privateServerId = deps.services.reserve(placeId)
++		assert(not cancelled(ticket), "launch cancelled")
+ 		local userIds = {}
+ 		for _, player in travelling do
+ 			table.insert(userIds, player.UserId)
+ 		end
+ 		deps.services.manifestSet(privateServerId, { ship = shipId, userIds = userIds, privateServerId = privateServerId, createdAt = deps.now() })
++		local options = deps.services.newOptions(code, shipId)
++		assert(not cancelled(ticket), "launch cancelled") -- last check before the irreversible step
+ 		deps.log("VoyageLaunched", { ship = shipId, crew = #travelling, mode = "teleport", server = privateServerId })
+-		deps.services.teleport(placeId, travelling, deps.services.newOptions(code, shipId))
++		deps.services.teleport(placeId, travelling, options)
+ 	end)
+-	if not ok then
++	if ok then
++		-- watchdog: a requested teleport that never completes must not leave anyone InTransit
++		for _, player in travelling do
++			task.delay(deps.transitTimeout or TRANSIT_TIMEOUT, function()
++				if player.Parent == Players and player:GetAttribute("InTransit") then
++					Voyages.teleportFailed(player, "teleport did not complete")
++				end
++			end)
++		end
++	else
+ 		for _, player in travelling do
+ 			Voyages.teleportFailed(player, tostring(err))
+ 		end
+@@ -138,7 +189,7 @@ function Voyages.teleportFailed(player, why)
+ 	end
+ 	local reclaimed = true
+ 	if deps.playerData and deps.playerData.reclaim then
+-		reclaimed = deps.playerData.reclaim(player) == true
++		reclaimed = safeCall(deps.playerData.reclaim, player) -- an exception counts as a failed re-claim
+ 	end
+ 	if not reclaimed then
+ 		deps.log("ReclaimFailed", { player = player.Name })
+@@ -150,9 +201,9 @@ function Voyages.teleportFailed(player, why)
+ end
+ 
+ -- Called by HarborDepartures at the end of a ship's countdown.
+-function Voyages.launch(shipId, crew)
++function Voyages.launch(shipId, crew, ticket)
+ 	if Config.TELEPORT_ENABLED then
+-		Voyages._teleport(shipId, crew)
++		Voyages._teleport(shipId, crew, ticket)
+ 	else
+ 		simulate(shipId, crew)
+ 	end
+@@ -169,13 +220,19 @@ function Voyages.returnToHarbor(player)
+ 		return false
+ 	end
+ 	player:SetAttribute("InTransit", true)
+-	if not deps.playerData.handoff(player) then
++	if not safeCall(deps.playerData.handoff, player) then
+ 		Voyages.teleportFailed(player, "save hand-off failed")
+ 		return true
+ 	end
+ 	local ok, err = pcall(deps.services.teleport, Config.HARBOR_PLACE_ID, { player }, nil)
+ 	if not ok then
+ 		Voyages.teleportFailed(player, tostring(err))
++	else
++		task.delay(deps.transitTimeout or TRANSIT_TIMEOUT, function()
++			if player.Parent == Players and player:GetAttribute("InTransit") then
++				Voyages.teleportFailed(player, "teleport did not complete")
++			end
++		end)
+ 	end
+ 	return true
+ end

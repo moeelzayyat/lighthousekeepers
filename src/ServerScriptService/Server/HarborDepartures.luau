@@ -8,6 +8,8 @@
 --     snapshot, and deps.launch(shipId, crew) takes the crew away (teleport, or a Studio simulation)
 --   * the ship takes a new party (ShipRoster.unlock) once launch() returns, errors, or exceeds LAUNCH_TIMEOUT
 --     (fix 3, 2026-10-16): a teleport problem can never leave a ship locked for good
+--   * every launch gets its own ticket; on timeout the ticket is cancelled, so that launch can never go on to
+--     teleport its (old) crew later, even after a new crew has boarded the same ship (2026-10-16)
 --
 -- Replicated on the GameState folder for the client, per ship:
 --   Ship_<id>_Phase    = "Waiting" | "Countdown" | "Sailing"
@@ -54,8 +56,9 @@ function HarborDepartures.start(deps)
 				if #crew > 0 then
 					publish(shipId, "Sailing", 0)
 					local finished = false
+					local ticket = { cancelled = false } -- this voyage only
 					task.spawn(function()
-						local ok, err = pcall(deps.launch, shipId, crew)
+						local ok, err = pcall(deps.launch, shipId, crew, ticket)
 						if not ok then
 							warn("[HarborDepartures] launch failed for " .. shipId .. ": " .. tostring(err))
 							deps.log("LaunchFailed", { ship = shipId, err = tostring(err) })
@@ -67,6 +70,7 @@ function HarborDepartures.start(deps)
 						task.wait(POLL)
 					end
 					if not finished then
+						ticket.cancelled = true -- the late launch must recover its crew, not teleport them
 						deps.log("LaunchTimeout", { ship = shipId })
 					end
 				end
