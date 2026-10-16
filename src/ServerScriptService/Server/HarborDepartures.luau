@@ -6,7 +6,8 @@
 --   * each ship has its own timer, its own state and its own lock; ships never share a countdown
 --   * at the end the request is revalidated (no yield before the freeze), ShipRoster.depart(id) freezes a fresh
 --     snapshot, and deps.launch(shipId, crew) takes the crew away (teleport, or a Studio simulation)
---   * the ship takes a new party (ShipRoster.unlock) once launch() returns
+--   * the ship takes a new party (ShipRoster.unlock) once launch() returns, errors, or exceeds LAUNCH_TIMEOUT
+--     (fix 3, 2026-10-16): a teleport problem can never leave a ship locked for good
 --
 -- Replicated on the GameState folder for the client, per ship:
 --   Ship_<id>_Phase    = "Waiting" | "Countdown" | "Sailing"
@@ -15,6 +16,7 @@
 local HarborDepartures = {}
 
 local POLL = 0.2
+local LAUNCH_TIMEOUT = 30 -- seconds a launch may take before the ship is released anyway
 
 -- deps: roster, departure (ShipDeparture), boarding (ShipBoarding), state, shipIds, seconds,
 --       launch(shipId, crew) -> (yields until the crew has left; errors are caught), log(kind, data)
@@ -51,10 +53,21 @@ function HarborDepartures.start(deps)
 				deps.departure.departed(shipId)
 				if #crew > 0 then
 					publish(shipId, "Sailing", 0)
-					local ok, err = pcall(deps.launch, shipId, crew)
-					if not ok then
-						warn("[HarborDepartures] launch failed for " .. shipId .. ": " .. tostring(err))
-						deps.log("LaunchFailed", { ship = shipId, err = tostring(err) })
+					local finished = false
+					task.spawn(function()
+						local ok, err = pcall(deps.launch, shipId, crew)
+						if not ok then
+							warn("[HarborDepartures] launch failed for " .. shipId .. ": " .. tostring(err))
+							deps.log("LaunchFailed", { ship = shipId, err = tostring(err) })
+						end
+						finished = true
+					end)
+					local waitUntil = os.clock() + (deps.launchTimeout or LAUNCH_TIMEOUT)
+					while not finished and os.clock() < waitUntil do
+						task.wait(POLL)
+					end
+					if not finished then
+						deps.log("LaunchTimeout", { ship = shipId })
 					end
 				end
 				deps.roster.unlock(shipId)

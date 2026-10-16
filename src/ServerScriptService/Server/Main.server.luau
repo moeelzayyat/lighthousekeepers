@@ -689,7 +689,8 @@ ShipBoarding.init({
 	log = EventLog.log,
 	mark = EventLog.mark,
 	canBoard = function(player)
-		return player:GetAttribute("InLobby") == true -- pressed Play (not on the title screen)
+		-- pressed Play (not on the title screen) and not on the way to a voyage server
+		return player:GetAttribute("InLobby") == true and not player:GetAttribute("InTransit")
 	end,
 })
 ShipDeparture.init({
@@ -929,6 +930,10 @@ end
 if ROLE == "isle" then
 	IsleAdmission.init({
 		manifest = Voyages.readManifest(),
+		studioTest = Config.ISLE_STUDIO_TEST == true and game:GetService("RunService"):IsStudio(),
+		privateServerId = game.PrivateServerId,
+		capacity = Config.MAX_CREW or 4,
+		now = os.time,
 		log = EventLog.log,
 		sendToHarbor = function(player)
 			if not Voyages.returnToHarbor(player) then

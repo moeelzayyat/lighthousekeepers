@@ -1,0 +1,657 @@
+diff --git a/src/ReplicatedStorage/Shared/Config.luau b/src/ReplicatedStorage/Shared/Config.luau
+index e734e69..943ec3a 100644
+--- a/src/ReplicatedStorage/Shared/Config.luau
++++ b/src/ReplicatedStorage/Shared/Config.luau
+@@ -56,6 +56,7 @@ local Config = {
+ 	HARBOR_PLACE_ID = 132065051336560, -- the Lighthouse Keepers start place
+ 	ISLE_PLACE_ID = 0, -- the Lighthouse Isle place, once the owner creates it (0 = not created)
+ 	ISLE_ARRIVAL_WAIT = 20, -- isle: seconds to wait for the whole crew before the voyage starts anyway
++	ISLE_STUDIO_TEST = false, -- isle without a voyage manifest: allowed ONLY when true AND running in Studio
+ 	DAWN_LOOT_SECONDS = 25, -- leftover loot stays this long into the day at full value (was 10; owner, Oct 12)
+ 	DAWN_LOOT_FRACTION = 0.5, -- at dawn the tide brings leftover loot to the crew at this fraction of its value
+ 	DARK_GRACE_SECONDS = 10, -- how long the lamp can be out before the run is lost
+diff --git a/src/ServerScriptService/Server/HarborDepartures.luau b/src/ServerScriptService/Server/HarborDepartures.luau
+index b51ab33..797eb09 100644
+--- a/src/ServerScriptService/Server/HarborDepartures.luau
++++ b/src/ServerScriptService/Server/HarborDepartures.luau
+@@ -6,7 +6,8 @@
+ --   * each ship has its own timer, its own state and its own lock; ships never share a countdown
+ --   * at the end the request is revalidated (no yield before the freeze), ShipRoster.depart(id) freezes a fresh
+ --     snapshot, and deps.launch(shipId, crew) takes the crew away (teleport, or a Studio simulation)
+---   * the ship takes a new party (ShipRoster.unlock) once launch() returns
++--   * the ship takes a new party (ShipRoster.unlock) once launch() returns, errors, or exceeds LAUNCH_TIMEOUT
++--     (fix 3, 2026-10-16): a teleport problem can never leave a ship locked for good
+ --
+ -- Replicated on the GameState folder for the client, per ship:
+ --   Ship_<id>_Phase    = "Waiting" | "Countdown" | "Sailing"
+@@ -15,6 +16,7 @@
+ local HarborDepartures = {}
+ 
+ local POLL = 0.2
++local LAUNCH_TIMEOUT = 30 -- seconds a launch may take before the ship is released anyway
+ 
+ -- deps: roster, departure (ShipDeparture), boarding (ShipBoarding), state, shipIds, seconds,
+ --       launch(shipId, crew) -> (yields until the crew has left; errors are caught), log(kind, data)
+@@ -51,10 +53,21 @@ function HarborDepartures.start(deps)
+ 				deps.departure.departed(shipId)
+ 				if #crew > 0 then
+ 					publish(shipId, "Sailing", 0)
+-					local ok, err = pcall(deps.launch, shipId, crew)
+-					if not ok then
+-						warn("[HarborDepartures] launch failed for " .. shipId .. ": " .. tostring(err))
+-						deps.log("LaunchFailed", { ship = shipId, err = tostring(err) })
++					local finished = false
++					task.spawn(function()
++						local ok, err = pcall(deps.launch, shipId, crew)
++						if not ok then
++							warn("[HarborDepartures] launch failed for " .. shipId .. ": " .. tostring(err))
++							deps.log("LaunchFailed", { ship = shipId, err = tostring(err) })
++						end
++						finished = true
++					end)
++					local waitUntil = os.clock() + (deps.launchTimeout or LAUNCH_TIMEOUT)
++					while not finished and os.clock() < waitUntil do
++						task.wait(POLL)
++					end
++					if not finished then
++						deps.log("LaunchTimeout", { ship = shipId })
+ 					end
+ 				end
+ 				deps.roster.unlock(shipId)
+diff --git a/src/ServerScriptService/Server/IsleAdmission.luau b/src/ServerScriptService/Server/IsleAdmission.luau
+index aa3cf41..39c7c84 100644
+--- a/src/ServerScriptService/Server/IsleAdmission.luau
++++ b/src/ServerScriptService/Server/IsleAdmission.luau
+@@ -2,10 +2,16 @@
+ -- its voyage starts. It plugs into the EXISTING voyage loop (GameState) through the same two hooks the
+ -- single-server game uses (deps.departure and deps.departShip), so no game logic is duplicated.
+ --
+---   * reserved server with a manifest (Voyages): only the listed UserIds are crew; anyone else is sent back to
+---     the harbor. The voyage starts when everyone listed has arrived, or ISLE_ARRIVAL_WAIT seconds after the
+---     first one did (crew-size scaling already uses the real count).
+---   * no manifest (Studio test with PLACE_ROLE_OVERRIDE = "isle"): everyone who joins is crew, same timing.
++-- Fail closed (fix 2, 2026-10-16):
++--   * A LIVE isle server needs a valid server-side manifest (Voyages): a table for THIS reserved server
++--     (privateServerId), not expired, with 1..capacity distinct positive UserIds. Missing, expired, malformed or
++--     foreign manifest -> no voyage at all, and everyone is sent back to the harbor.
++--   * The manifest-free simulation (everyone who joins is crew) exists ONLY in explicit Studio test mode
++--     (Config.ISLE_STUDIO_TEST = true AND running in Studio).
++--   * Only listed UserIds may become crew. The voyage starts when every listed player has arrived, or
++--     ISLE_ARRIVAL_WAIT seconds after the first arrival with whoever is here (fewer than four is fine).
++--   * Once the voyage is frozen, nobody else joins it: a late arrival (listed or not) is sent back to the harbor
++--     and is never Ready, so it never earns run rewards. If nobody arrives, no voyage starts.
+ --   * Play Again: the players who chose it sail again in this same server (GameState's rematch flow).
+ 
+ local Players = game:GetService("Players")
+@@ -16,53 +22,104 @@ local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Co
+ local IsleAdmission = {}
+ 
+ local SHIP_ID = "Isle"
++local MANIFEST_MAX_AGE = 600 -- seconds; matches the manifest's MemoryStore expiry in Voyages
+ 
+-local deps = nil
+-local expected = nil -- { [userId] = true } from the manifest, or nil = anyone
+-local expectedCount = 0
+-local firstArrival = nil
+-local started = false
+-local rematchWanted = false
++-- Pure check of a manifest for this server. Returns ok, reason, { [userId] = true }, count.
++function IsleAdmission.validate(manifest, privateServerId, capacity, now)
++	if type(manifest) ~= "table" then
++		return false, "missing"
++	end
++	if manifest.privateServerId ~= privateServerId or type(privateServerId) ~= "string" or privateServerId == "" then
++		return false, "wrong server"
++	end
++	if type(manifest.createdAt) ~= "number" or now - manifest.createdAt > MANIFEST_MAX_AGE or manifest.createdAt > now + 60 then
++		return false, "expired"
++	end
++	if type(manifest.userIds) ~= "table" or #manifest.userIds < 1 or #manifest.userIds > capacity then
++		return false, "bad crew size"
++	end
++	local set, count = {}, 0
++	for _, id in manifest.userIds do
++		if type(id) ~= "number" or id <= 0 or id % 1 ~= 0 or set[id] then
++			return false, "bad user id"
++		end
++		set[id] = true
++		count += 1
++	end
++	return true, "ok", set, count
++end
++
++-- per-server state (reset by init)
++local deps, expected, expectedCount, firstArrival, started, rematchWanted, closed
++
++local function getPlayers()
++	return if deps and deps.players then deps.players() else Players:GetPlayers()
++end
++
++local function eligible(player)
++	return player:GetAttribute("InLobby") == true and (expected == nil or expected[player.UserId] == true)
++end
+ 
+ local function admitted()
+ 	local list = {}
+-	for _, player in Players:GetPlayers() do
+-		if player:GetAttribute("InLobby") == true and (expected == nil or expected[player.UserId]) then
++	for _, player in getPlayers() do
++		if eligible(player) and not player:GetAttribute("IsleLate") then
+ 			table.insert(list, player)
+ 		end
+ 	end
+ 	return list
+ end
+ 
+--- deps: manifest (table or nil), sendToHarbor(player), log(kind, data)
++local function turnAway(player, why)
++	player:SetAttribute("IsleLate", true)
++	deps.log("IsleRefused", { player = player.Name, why = why })
++	deps.sendToHarbor(player)
++end
++
++-- deps: manifest (table or nil), studioTest (bool), privateServerId, capacity, now(), sendToHarbor(player),
++--       log(kind, data), players (optional list source for tests)
+ function IsleAdmission.init(d)
+ 	deps = d
+-	if d.manifest and d.manifest.userIds then
+-		expected = {}
+-		for _, id in d.manifest.userIds do
+-			expected[id] = true
+-			expectedCount += 1
++	expected, expectedCount, firstArrival, started, rematchWanted, closed = nil, 0, nil, false, false, false
++	if d.manifest == nil and d.studioTest then
++		deps.log("IsleStudioTest", {}) -- manifest-free simulation: explicit Studio test mode only
++	else
++		local ok, reason, set, count = IsleAdmission.validate(d.manifest, d.privateServerId, d.capacity or 4, d.now())
++		if ok then
++			expected, expectedCount = set, count
++		else
++			closed = true -- fail closed: no voyage in this server
++			deps.log("IsleClosed", { why = reason })
+ 		end
+ 	end
+ 	local function onJoin(player)
+-		if expected and not expected[player.UserId] then
+-			deps.log("IsleRefused", { player = player.Name })
+-			deps.sendToHarbor(player)
++		if closed then
++			turnAway(player, "no valid voyage manifest")
++		elseif expected and not expected[player.UserId] then
++			turnAway(player, "not in this crew")
++		elseif started then
++			turnAway(player, "voyage already sailed") -- a Play Again rematch is for the crew already here
+ 		end
+ 	end
+-	Players.PlayerAdded:Connect(onJoin)
+-	for _, player in Players:GetPlayers() do
++	if not d.players then
++		Players.PlayerAdded:Connect(onJoin)
++	end
++	for _, player in getPlayers() do
+ 		onJoin(player)
+ 	end
++	IsleAdmission._onJoin = onJoin -- test hook
+ end
+ 
+ -- GameState: is there a voyage to start?
+ function IsleAdmission.requested()
++	if closed then
++		return false
++	end
+ 	if started then
+ 		if not rematchWanted then
+ 			return false
+ 		end
+-		for _, player in Players:GetPlayers() do
++		for _, player in getPlayers() do
+ 			if player:GetAttribute("Ready") == true then
+ 				return true
+ 			end
+@@ -72,11 +129,11 @@ function IsleAdmission.requested()
+ 	end
+ 	local list = admitted()
+ 	if #list == 0 then
+-		return false
++		return false -- nobody here (yet): no voyage
+ 	end
+-	firstArrival = firstArrival or os.clock()
++	firstArrival = firstArrival or deps.now()
+ 	local everyone = expected ~= nil and #list >= expectedCount
+-	return everyone or os.clock() - firstArrival >= (Config.ISLE_ARRIVAL_WAIT or 20)
++	return everyone or deps.now() - firstArrival >= (Config.ISLE_ARRIVAL_WAIT or 20)
+ end
+ 
+ -- GameState: the countdown finished; these players sail (the existing loop takes them to the lighthouse).
+@@ -84,19 +141,25 @@ function IsleAdmission.depart()
+ 	if started and rematchWanted then
+ 		rematchWanted = false
+ 		local crew = {}
+-		for _, player in Players:GetPlayers() do
++		for _, player in getPlayers() do
+ 			if player:GetAttribute("Ready") == true then
+ 				table.insert(crew, player)
+ 			end
+ 		end
+ 		return crew
+ 	end
+-	started = true
++	started = true -- frozen: from now on every new arrival is turned away
+ 	local crew = admitted()
+ 	for _, player in crew do
+ 		player:SetAttribute("ShipId", SHIP_ID)
+ 		player:SetAttribute("Ready", true)
+ 	end
++	-- listed players who are here but not admitted (e.g. still on the title flow) do not sail either
++	for _, player in getPlayers() do
++		if player:GetAttribute("Ready") ~= true and not player:GetAttribute("IsleLate") then
++			turnAway(player, "missed the departure")
++		end
++	end
+ 	deps.log("IsleVoyage", { crew = #crew, expected = expectedCount })
+ 	return crew
+ end
+@@ -106,4 +169,8 @@ function IsleAdmission.rematch()
+ 	rematchWanted = true
+ end
+ 
++function IsleAdmission.isClosed()
++	return closed
++end
++
+ return IsleAdmission
+diff --git a/src/ServerScriptService/Server/Main.server.luau b/src/ServerScriptService/Server/Main.server.luau
+index 84d74e2..76fdbfc 100644
+--- a/src/ServerScriptService/Server/Main.server.luau
++++ b/src/ServerScriptService/Server/Main.server.luau
+@@ -689,7 +689,8 @@ ShipBoarding.init({
+ 	log = EventLog.log,
+ 	mark = EventLog.mark,
+ 	canBoard = function(player)
+-		return player:GetAttribute("InLobby") == true -- pressed Play (not on the title screen)
++		-- pressed Play (not on the title screen) and not on the way to a voyage server
++		return player:GetAttribute("InLobby") == true and not player:GetAttribute("InTransit")
+ 	end,
+ })
+ ShipDeparture.init({
+@@ -929,6 +930,10 @@ end
+ if ROLE == "isle" then
+ 	IsleAdmission.init({
+ 		manifest = Voyages.readManifest(),
++		studioTest = Config.ISLE_STUDIO_TEST == true and game:GetService("RunService"):IsStudio(),
++		privateServerId = game.PrivateServerId,
++		capacity = Config.MAX_CREW or 4,
++		now = os.time,
+ 		log = EventLog.log,
+ 		sendToHarbor = function(player)
+ 			if not Voyages.returnToHarbor(player) then
+diff --git a/src/ServerScriptService/Server/SessionLock.luau b/src/ServerScriptService/Server/SessionLock.luau
+index 45dd953..6371954 100644
+--- a/src/ServerScriptService/Server/SessionLock.luau
++++ b/src/ServerScriptService/Server/SessionLock.luau
+@@ -7,9 +7,11 @@
+ --   * job   : the claiming server's JobId (for logs)
+ --   * at    : last heartbeat (os.time). A session older than staleSeconds may be taken over (crashed server).
+ --
+--- Rules (auditor list, 2026-10-15):
++-- Rules (auditor list, 2026-10-15; fixes 2026-10-16):
+ --   1. claim(): atomic in UpdateAsync. If another live session holds the key, the write is cancelled (nil) and
+ --      claim retries until waitSeconds, then fails (the caller keeps the player in memory-only mode).
++--      A brand-new key (no stored value) is created with the caller's default profile: returning nil from the
++--      transform would CANCEL the write, so the lock would never be stored (fix 1, 2026-10-16).
+ --   2. save(): atomic ownership check inside UpdateAsync; a stale or foreign token cancels the write.
+ --   3. heartbeat(): refreshes `at` even when the profile is unchanged (same ownership check).
+ --   4. Existing metadata fields and the key's UserIds are always carried over.
+@@ -17,9 +19,11 @@
+ --   6. reclaim after a failed teleport: claim() again; it succeeds at once because the key is free (or ours).
+ --   7. Per-key operations are serialized (one at a time, in call order), so PlayerRemoving, autosave and
+ --      release can never interleave inside one server.
+---   8. Old servers (pre-lock code) write without metadata, which clears any session. The lock then sees the key
+---      as free. Deploy only with "Shut down all servers" / "Migrate to latest update" so no old server runs
+---      beside new ones (see the phase 2 package).
++--   8. Old servers (pre-lock code) write without metadata, which clears any session. The new owner's next write is
++--      then fenced ("lock lost"). Production cutover must stop every old writer first (see the fix package).
++--   9. Success is never inferred from pcall alone: every claim/save/release is confirmed against the metadata
++--      UpdateAsync reports as COMMITTED (its second return, DataStoreKeyInfo). The transform may be re-invoked,
++--      so it keeps no state between invocations except what it recomputes each time.
+ 
+ local HttpService = game:GetService("HttpService")
+ 
+@@ -54,6 +58,12 @@ local function userIdsOf(keyInfo)
+ 	return if keyInfo then keyInfo:GetUserIds() else {}
+ end
+ 
++-- the session token the store reports as committed (nil if none)
++local function committedToken(keyInfo)
++	local meta = keyInfo and keyInfo:GetMetadata()
++	return meta and meta.session and meta.session.token
++end
++
+ -- serialize every operation on one key
+ function SessionLock:_run(key, fn)
+ 	local q = self.queues[key]
+@@ -79,33 +89,46 @@ function SessionLock:_run(key, fn)
+ 	return table.unpack(results, 2, results.n)
+ end
+ 
+--- Returns ok, value (the stored profile, possibly nil for a new player), reason
+-function SessionLock:claim(key)
++-- Returns ok, value (the stored profile, or the default written for a brand-new key), reason.
++-- defaultValue: the profile to create when the key has no value yet (required for new players).
++function SessionLock:claim(key, defaultValue)
+ 	return self:_run(key, function()
+ 		local started = self.now()
++		local lastReason = "no attempt"
++		local tried = {} -- every token this claim has tried: an attempt may have committed although it errored
+ 		while true do
+ 			local token = HttpService:GenerateGUID(false)
++			tried[token] = true
+ 			local busy, value = false, nil
+-			local ok, err = pcall(function()
+-				self.store:UpdateAsync(key, function(current, keyInfo)
+-					local meta = copyMeta(keyInfo)
++			local ok, result, keyInfo = pcall(function()
++				return self.store:UpdateAsync(key, function(current, info)
++					busy, value = false, nil -- recomputed on every (re-)invocation
++					local meta = copyMeta(info)
+ 					local s = meta.session
+-					local mine = s ~= nil and s.token == self.tokens[key]
++					local mine = s ~= nil and (s.token == self.tokens[key] or tried[s.token] == true)
+ 					if s ~= nil and not mine and type(s.at) == "number" and self.now() - s.at < self.staleSeconds then
+ 						busy = true
+ 						return nil -- another live session: cancel the write
+ 					end
++					local stored = if current ~= nil then current else defaultValue
++					if stored == nil then
++						return nil -- new key and no default profile: nothing may be written
++					end
+ 					meta.session = { token = token, job = self.jobId, at = self.now() }
+-					value = current
+-					return current, userIdsOf(keyInfo), meta
++					value = stored
++					return stored, userIdsOf(info), meta
+ 				end)
+ 			end)
+-			if ok and not busy then
++			if ok and not busy and committedToken(keyInfo) == token then
+ 				self.tokens[key] = token
+ 				return true, value, "claimed"
+ 			end
+-			if self.now() - started >= self.waitSeconds then
+-				return false, nil, if busy then "locked by another server" else "store error: " .. tostring(err)
++			lastReason = if not ok then "store error: " .. tostring(result)
++				elseif busy then "locked by another server"
++				elseif value == nil then "no profile to create"
++				else "lock not confirmed"
++			if lastReason == "no profile to create" or self.now() - started >= self.waitSeconds then
++				return false, nil, lastReason
+ 			end
+ 			self.sleep(1)
+ 		end
+@@ -119,16 +142,17 @@ function SessionLock:_write(key, newValue, releaseAfter)
+ 		return false, "not owned"
+ 	end
+ 	local lost = false
+-	local ok, err = pcall(function()
+-		self.store:UpdateAsync(key, function(current, keyInfo)
+-			local meta = copyMeta(keyInfo)
+-			if meta.session == nil or meta.session.token ~= token then
++	local ok, result, keyInfo = pcall(function()
++		return self.store:UpdateAsync(key, function(current, info)
++			lost = false -- recomputed on every (re-)invocation
++			local meta = copyMeta(info)
++			if current == nil or meta.session == nil or meta.session.token ~= token then
+ 				lost = true
+-				return nil -- fenced: somebody else owns the key now
++				return nil -- fenced: somebody else owns the key now (or it vanished)
+ 			end
+ 			meta.session = if releaseAfter then nil else { token = token, job = self.jobId, at = self.now() }
+ 			local value = if newValue ~= nil then newValue else current
+-			return value, userIdsOf(keyInfo), meta
++			return value, userIdsOf(info), meta
+ 		end)
+ 	end)
+ 	if lost then
+@@ -136,12 +160,21 @@ function SessionLock:_write(key, newValue, releaseAfter)
+ 		return false, "lock lost"
+ 	end
+ 	if not ok then
+-		return false, "store error: " .. tostring(err) -- still owned; the caller retries later
++		return false, "store error: " .. tostring(result) -- still owned; the caller retries later
+ 	end
++	-- confirm what was committed, not just that the call returned
++	local committed = committedToken(keyInfo)
+ 	if releaseAfter then
++		if keyInfo == nil or committed ~= nil then
++			return false, "release not confirmed"
++		end
+ 		self.tokens[key] = nil
++		return true, "released"
++	end
++	if committed ~= token then
++		return false, "save not confirmed"
+ 	end
+-	return true, if releaseAfter then "released" else "saved"
++	return true, "saved"
+ end
+ 
+ function SessionLock:save(key, value)
+diff --git a/src/ServerScriptService/Server/Voyages.luau b/src/ServerScriptService/Server/Voyages.luau
+index 083ae23..dd30970 100644
+--- a/src/ServerScriptService/Server/Voyages.luau
++++ b/src/ServerScriptService/Server/Voyages.luau
+@@ -5,18 +5,22 @@
+ -- crew is moved back to the harbor spawn and leaves the party, so boarding and countdowns can be tested.
+ --
+ -- TELEPORT_ENABLED = true (owner-only, needs the Isle place and a published test environment):
+---   1. ReserveServer(ISLE_PLACE_ID) -> access code + private server id
+---   2. a MANIFEST in MemoryStore (map "Voyages", key = private server id, short expiry): the crew's UserIds,
+---      ship and forecast votes. No balances, inventory or progress ever travel: the Isle loads saves itself.
+---   3. PlayerData.handoff(player) for each member (awaited final save + session release; see SessionLock)
+---   4. TeleportAsync(ISLE_PLACE_ID, crew, options) with ReservedServerAccessCode. TeleportData only carries
++--   1. every crew member leaves the ship's party and is marked InTransit (cannot board again, cannot be counted
++--      twice, the ship can take a new crew at once) - no duplicate launch of the same players is possible
++--   2. PlayerData.handoff(player) for each member: awaited final save + session release. While released the
++--      profile must not change (handoff freezes it; see the fix package). A member whose hand-off fails stays.
++--   3. ReserveServer(ISLE_PLACE_ID) -> access code + private server id
++--   4. a MANIFEST in MemoryStore (map "Voyages", key = private server id, short expiry) listing ONLY the members
++--      whose hand-off succeeded: their UserIds, the ship, this private server id and the time. No balances,
++--      inventory or progress ever travel: the Isle loads saves itself.
++--   5. TeleportAsync(ISLE_PLACE_ID, travelling, options) with ReservedServerAccessCode. TeleportData only carries
+ --      { ship } for the loading screen and is never trusted.
+---   A member whose teleport fails stays in the harbor, keeps the party seat (normal boarding rules apply again)
+---   and their save session is re-claimed by the harbor (PlayerData.reclaim). Nothing is deleted.
++--   Failure at any step (fix 3, 2026-10-16): the member stays in the harbor, is NOT put back into a party (the ship
++--   may already have a new crew; they can board again), and must RE-CLAIM their save session before playing on.
++--   If the re-claim fails they are disconnected with a message, so they rejoin and load their saved progress fresh.
+ 
+ local Players = game:GetService("Players")
+ local ReplicatedStorage = game:GetService("ReplicatedStorage")
+-local TeleportService = game:GetService("TeleportService")
+ 
+ local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+ 
+@@ -27,14 +31,47 @@ local MANIFEST_SECONDS = 600
+ 
+ local deps = nil
+ 
++-- the real Roblox services; tests pass fakes through deps.services
++local function realServices()
++	local TeleportService = game:GetService("TeleportService")
++	local map = function()
++		return game:GetService("MemoryStoreService"):GetSortedMap(MANIFEST_MAP)
++	end
++	return {
++		reserve = function(placeId)
++			return TeleportService:ReserveServer(placeId)
++		end,
++		teleport = function(placeId, players, options)
++			return TeleportService:TeleportAsync(placeId, players, options)
++		end,
++		newOptions = function(code, ship)
++			local options = Instance.new("TeleportOptions")
++			options.ReservedServerAccessCode = code
++			options:SetTeleportData({ ship = ship })
++			return options
++		end,
++		manifestSet = function(id, manifest)
++			map():SetAsync(id, manifest, MANIFEST_SECONDS)
++		end,
++		manifestGet = function(id)
++			return map():GetAsync(id)
++		end,
++		initFailed = TeleportService.TeleportInitFailed,
++	}
++end
++
+ -- deps: notify(player, text), log(kind, data), sendToHarbor(player) (move to the harbor spawn),
+---       playerData (handoff/reclaim, teleport mode only), roster (ShipRoster)
++--       playerData (handoff/reclaim, teleport mode only), roster (ShipRoster), services (tests only), now (os.time)
+ function Voyages.init(d)
+ 	deps = d
+-	if Config.TELEPORT_ENABLED then
+-		TeleportService.TeleportInitFailed:Connect(function(player, result, message)
+-			Voyages.teleportFailed(player, tostring(result) .. " " .. tostring(message))
+-		end)
++	deps.now = deps.now or os.time
++	if Config.TELEPORT_ENABLED or deps.services then
++		deps.services = deps.services or realServices()
++		if deps.services.initFailed then
++			deps.services.initFailed:Connect(function(player, result, message)
++				Voyages.teleportFailed(player, tostring(result) .. " " .. tostring(message))
++			end)
++		end
+ 	end
+ end
+ 
+@@ -47,35 +84,42 @@ local function simulate(shipId, crew)
+ 	end
+ end
+ 
+-local function teleport(shipId, crew)
+-	assert(Config.ISLE_PLACE_ID ~= 0, "ISLE_PLACE_ID is not set")
++-- the real flow (also driven directly by the tests with fake services)
++function Voyages._teleport(shipId, crew)
++	assert(Config.ISLE_PLACE_ID ~= 0 or deps.services.testPlaceId, "ISLE_PLACE_ID is not set")
+ 	-- never move a player between servers without the guarded save hand-off
+ 	assert(deps.playerData and deps.playerData.handoff and deps.playerData.reclaim, "save hand-off adapter not wired: refusing to teleport")
+-	local code, privateServerId = TeleportService:ReserveServer(Config.ISLE_PLACE_ID)
+-	local userIds = {}
++	local placeId = deps.services.testPlaceId or Config.ISLE_PLACE_ID
++
++	-- 1. out of the party at once: no second launch of these players, the ship is free for a new crew
+ 	for _, player in crew do
+-		table.insert(userIds, player.UserId)
++		player:SetAttribute("InTransit", true)
++		deps.roster.leave(player, "travelling")
+ 	end
+-	local manifest = { ship = shipId, userIds = userIds, createdAt = os.time() }
+-	game:GetService("MemoryStoreService"):GetSortedMap(MANIFEST_MAP):SetAsync(privateServerId, manifest, MANIFEST_SECONDS)
+-	-- hand every save over before anyone leaves (awaited final save + release); a member whose hand-off
+-	-- fails does not travel
++	-- 2. awaited hand-off of every save; only successful members travel
+ 	local travelling = {}
+ 	for _, player in crew do
+-		if deps.playerData.handoff(player) then
++		if player.Parent == Players and deps.playerData.handoff(player) then
+ 			table.insert(travelling, player)
+ 		else
+ 			Voyages.teleportFailed(player, "save hand-off failed")
+ 		end
+ 	end
+ 	if #travelling == 0 then
++		deps.log("VoyageCancelled", { ship = shipId, why = "no traveller handed off" })
+ 		return
+ 	end
+-	local options = Instance.new("TeleportOptions")
+-	options.ReservedServerAccessCode = code
+-	options:SetTeleportData({ ship = shipId })
+-	deps.log("VoyageLaunched", { ship = shipId, crew = #travelling, mode = "teleport", server = privateServerId })
+-	local ok, err = pcall(TeleportService.TeleportAsync, TeleportService, Config.ISLE_PLACE_ID, travelling, options)
++	-- 3-5. reserve, manifest of exactly the travellers, teleport
++	local ok, err = pcall(function()
++		local code, privateServerId = deps.services.reserve(placeId)
++		local userIds = {}
++		for _, player in travelling do
++			table.insert(userIds, player.UserId)
++		end
++		deps.services.manifestSet(privateServerId, { ship = shipId, userIds = userIds, privateServerId = privateServerId, createdAt = deps.now() })
++		deps.log("VoyageLaunched", { ship = shipId, crew = #travelling, mode = "teleport", server = privateServerId })
++		deps.services.teleport(placeId, travelling, deps.services.newOptions(code, shipId))
++	end)
+ 	if not ok then
+ 		for _, player in travelling do
+ 			Voyages.teleportFailed(player, tostring(err))
+@@ -83,25 +127,32 @@ local function teleport(shipId, crew)
+ 	end
+ end
+ 
+--- A member who could not travel: still in the harbor, keeps the seat, keeps (re-claims) the save session.
++-- A member who could not travel: stays in the harbor, out of any party, and must re-claim the save session.
+ function Voyages.teleportFailed(player, why)
+-	if player.Parent ~= Players then
+-		return
++	if player.Parent ~= Players or not player:GetAttribute("InTransit") then
++		return -- gone, or already handled (a pcall error and TeleportInitFailed can both report one failure)
+ 	end
+ 	deps.log("TeleportFailed", { player = player.Name, why = why })
++	if deps.roster.shipOf(player) ~= nil then
++		deps.roster.leave(player, "teleport failed")
++	end
++	local reclaimed = true
+ 	if deps.playerData and deps.playerData.reclaim then
+-		deps.playerData.reclaim(player)
++		reclaimed = deps.playerData.reclaim(player) == true
+ 	end
+-	if deps.roster.shipOf(player) ~= nil then
+-		player:SetAttribute("BoardedByDeck", true) -- normal boarding rules apply again (stepping off frees the seat)
++	if not reclaimed then
++		deps.log("ReclaimFailed", { player = player.Name })
++		player:Kick("Lighthouse Keepers: the voyage could not start and your save could not be reopened here. Your progress is saved: please rejoin.")
++		return
+ 	end
+-	deps.notify(player, "The ship couldn't reach Lighthouse Isle. You're still in the harbor with your crew seat. Try SAIL NOW again.")
++	player:SetAttribute("InTransit", nil)
++	deps.notify(player, "The ship couldn't reach Lighthouse Isle. You're still in the harbor: walk aboard a ship to try again.")
+ end
+ 
+ -- Called by HarborDepartures at the end of a ship's countdown.
+ function Voyages.launch(shipId, crew)
+ 	if Config.TELEPORT_ENABLED then
+-		teleport(shipId, crew)
++		Voyages._teleport(shipId, crew)
+ 	else
+ 		simulate(shipId, crew)
+ 	end
+@@ -117,25 +168,25 @@ function Voyages.returnToHarbor(player)
+ 		warn("[Voyages] save hand-off adapter not wired: not teleporting " .. player.Name)
+ 		return false
+ 	end
++	player:SetAttribute("InTransit", true)
+ 	if not deps.playerData.handoff(player) then
+-		deps.notify(player, "Saving your progress before the trip back failed. Try again in a moment.")
++		Voyages.teleportFailed(player, "save hand-off failed")
+ 		return true
+ 	end
+-	local ok, err = pcall(TeleportService.TeleportAsync, TeleportService, Config.HARBOR_PLACE_ID, { player })
++	local ok, err = pcall(deps.services.teleport, Config.HARBOR_PLACE_ID, { player }, nil)
+ 	if not ok then
+ 		Voyages.teleportFailed(player, tostring(err))
+ 	end
+ 	return true
+ end
+ 
+--- Isle side: read this reserved server's manifest. Returns nil outside a reserved server or when missing.
++-- Isle side: read this reserved server's manifest (nil outside a reserved server, when missing or on error).
++-- IsleAdmission validates it and fails closed.
+ function Voyages.readManifest()
+ 	if not Config.TELEPORT_ENABLED or game.PrivateServerId == "" then
+ 		return nil
+ 	end
+-	local ok, manifest = pcall(function()
+-		return game:GetService("MemoryStoreService"):GetSortedMap(MANIFEST_MAP):GetAsync(game.PrivateServerId)
+-	end)
++	local ok, manifest = pcall(deps.services.manifestGet, game.PrivateServerId)
+ 	return if ok then manifest else nil
+ end
+ 

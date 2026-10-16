@@ -2,10 +2,16 @@
 -- its voyage starts. It plugs into the EXISTING voyage loop (GameState) through the same two hooks the
 -- single-server game uses (deps.departure and deps.departShip), so no game logic is duplicated.
 --
---   * reserved server with a manifest (Voyages): only the listed UserIds are crew; anyone else is sent back to
---     the harbor. The voyage starts when everyone listed has arrived, or ISLE_ARRIVAL_WAIT seconds after the
---     first one did (crew-size scaling already uses the real count).
---   * no manifest (Studio test with PLACE_ROLE_OVERRIDE = "isle"): everyone who joins is crew, same timing.
+-- Fail closed (fix 2, 2026-10-16):
+--   * A LIVE isle server needs a valid server-side manifest (Voyages): a table for THIS reserved server
+--     (privateServerId), not expired, with 1..capacity distinct positive UserIds. Missing, expired, malformed or
+--     foreign manifest -> no voyage at all, and everyone is sent back to the harbor.
+--   * The manifest-free simulation (everyone who joins is crew) exists ONLY in explicit Studio test mode
+--     (Config.ISLE_STUDIO_TEST = true AND running in Studio).
+--   * Only listed UserIds may become crew. The voyage starts when every listed player has arrived, or
+--     ISLE_ARRIVAL_WAIT seconds after the first arrival with whoever is here (fewer than four is fine).
+--   * Once the voyage is frozen, nobody else joins it: a late arrival (listed or not) is sent back to the harbor
+--     and is never Ready, so it never earns run rewards. If nobody arrives, no voyage starts.
 --   * Play Again: the players who chose it sail again in this same server (GameState's rematch flow).
 
 local Players = game:GetService("Players")
@@ -16,53 +22,104 @@ local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Co
 local IsleAdmission = {}
 
 local SHIP_ID = "Isle"
+local MANIFEST_MAX_AGE = 600 -- seconds; matches the manifest's MemoryStore expiry in Voyages
 
-local deps = nil
-local expected = nil -- { [userId] = true } from the manifest, or nil = anyone
-local expectedCount = 0
-local firstArrival = nil
-local started = false
-local rematchWanted = false
+-- Pure check of a manifest for this server. Returns ok, reason, { [userId] = true }, count.
+function IsleAdmission.validate(manifest, privateServerId, capacity, now)
+	if type(manifest) ~= "table" then
+		return false, "missing"
+	end
+	if manifest.privateServerId ~= privateServerId or type(privateServerId) ~= "string" or privateServerId == "" then
+		return false, "wrong server"
+	end
+	if type(manifest.createdAt) ~= "number" or now - manifest.createdAt > MANIFEST_MAX_AGE or manifest.createdAt > now + 60 then
+		return false, "expired"
+	end
+	if type(manifest.userIds) ~= "table" or #manifest.userIds < 1 or #manifest.userIds > capacity then
+		return false, "bad crew size"
+	end
+	local set, count = {}, 0
+	for _, id in manifest.userIds do
+		if type(id) ~= "number" or id <= 0 or id % 1 ~= 0 or set[id] then
+			return false, "bad user id"
+		end
+		set[id] = true
+		count += 1
+	end
+	return true, "ok", set, count
+end
+
+-- per-server state (reset by init)
+local deps, expected, expectedCount, firstArrival, started, rematchWanted, closed
+
+local function getPlayers()
+	return if deps and deps.players then deps.players() else Players:GetPlayers()
+end
+
+local function eligible(player)
+	return player:GetAttribute("InLobby") == true and (expected == nil or expected[player.UserId] == true)
+end
 
 local function admitted()
 	local list = {}
-	for _, player in Players:GetPlayers() do
-		if player:GetAttribute("InLobby") == true and (expected == nil or expected[player.UserId]) then
+	for _, player in getPlayers() do
+		if eligible(player) and not player:GetAttribute("IsleLate") then
 			table.insert(list, player)
 		end
 	end
 	return list
 end
 
--- deps: manifest (table or nil), sendToHarbor(player), log(kind, data)
+local function turnAway(player, why)
+	player:SetAttribute("IsleLate", true)
+	deps.log("IsleRefused", { player = player.Name, why = why })
+	deps.sendToHarbor(player)
+end
+
+-- deps: manifest (table or nil), studioTest (bool), privateServerId, capacity, now(), sendToHarbor(player),
+--       log(kind, data), players (optional list source for tests)
 function IsleAdmission.init(d)
 	deps = d
-	if d.manifest and d.manifest.userIds then
-		expected = {}
-		for _, id in d.manifest.userIds do
-			expected[id] = true
-			expectedCount += 1
+	expected, expectedCount, firstArrival, started, rematchWanted, closed = nil, 0, nil, false, false, false
+	if d.manifest == nil and d.studioTest then
+		deps.log("IsleStudioTest", {}) -- manifest-free simulation: explicit Studio test mode only
+	else
+		local ok, reason, set, count = IsleAdmission.validate(d.manifest, d.privateServerId, d.capacity or 4, d.now())
+		if ok then
+			expected, expectedCount = set, count
+		else
+			closed = true -- fail closed: no voyage in this server
+			deps.log("IsleClosed", { why = reason })
 		end
 	end
 	local function onJoin(player)
-		if expected and not expected[player.UserId] then
-			deps.log("IsleRefused", { player = player.Name })
-			deps.sendToHarbor(player)
+		if closed then
+			turnAway(player, "no valid voyage manifest")
+		elseif expected and not expected[player.UserId] then
+			turnAway(player, "not in this crew")
+		elseif started then
+			turnAway(player, "voyage already sailed") -- a Play Again rematch is for the crew already here
 		end
 	end
-	Players.PlayerAdded:Connect(onJoin)
-	for _, player in Players:GetPlayers() do
+	if not d.players then
+		Players.PlayerAdded:Connect(onJoin)
+	end
+	for _, player in getPlayers() do
 		onJoin(player)
 	end
+	IsleAdmission._onJoin = onJoin -- test hook
 end
 
 -- GameState: is there a voyage to start?
 function IsleAdmission.requested()
+	if closed then
+		return false
+	end
 	if started then
 		if not rematchWanted then
 			return false
 		end
-		for _, player in Players:GetPlayers() do
+		for _, player in getPlayers() do
 			if player:GetAttribute("Ready") == true then
 				return true
 			end
@@ -72,11 +129,11 @@ function IsleAdmission.requested()
 	end
 	local list = admitted()
 	if #list == 0 then
-		return false
+		return false -- nobody here (yet): no voyage
 	end
-	firstArrival = firstArrival or os.clock()
+	firstArrival = firstArrival or deps.now()
 	local everyone = expected ~= nil and #list >= expectedCount
-	return everyone or os.clock() - firstArrival >= (Config.ISLE_ARRIVAL_WAIT or 20)
+	return everyone or deps.now() - firstArrival >= (Config.ISLE_ARRIVAL_WAIT or 20)
 end
 
 -- GameState: the countdown finished; these players sail (the existing loop takes them to the lighthouse).
@@ -84,18 +141,24 @@ function IsleAdmission.depart()
 	if started and rematchWanted then
 		rematchWanted = false
 		local crew = {}
-		for _, player in Players:GetPlayers() do
+		for _, player in getPlayers() do
 			if player:GetAttribute("Ready") == true then
 				table.insert(crew, player)
 			end
 		end
 		return crew
 	end
-	started = true
+	started = true -- frozen: from now on every new arrival is turned away
 	local crew = admitted()
 	for _, player in crew do
 		player:SetAttribute("ShipId", SHIP_ID)
 		player:SetAttribute("Ready", true)
+	end
+	-- listed players who are here but not admitted (e.g. still on the title flow) do not sail either
+	for _, player in getPlayers() do
+		if player:GetAttribute("Ready") ~= true and not player:GetAttribute("IsleLate") then
+			turnAway(player, "missed the departure")
+		end
 	end
 	deps.log("IsleVoyage", { crew = #crew, expected = expectedCount })
 	return crew
@@ -104,6 +167,10 @@ end
 -- GameState: Play Again was chosen by at least one crew member
 function IsleAdmission.rematch()
 	rematchWanted = true
+end
+
+function IsleAdmission.isClosed()
+	return closed
 end
 
 return IsleAdmission
