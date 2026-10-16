@@ -22,4 +22,11 @@ function PlaceRole.get()
 	return "harbor"
 end
 
+-- Harbor (2026-10-16): did this player arrive by teleport from the Lighthouse Isle place (the end of a voyage)?
+-- joinData is Player:GetJoinData(); SourcePlaceId is filled in by Roblox for teleports. Used only to skip the title
+-- screen, so a wrong answer can never grant anything.
+function PlaceRole.arrivedFromIsle(joinData)
+	return type(joinData) == "table" and Config.ISLE_PLACE_ID ~= 0 and joinData.SourcePlaceId == Config.ISLE_PLACE_ID
+end
+
 return PlaceRole

@@ -423,7 +423,19 @@ local function render()
 	harbor.Visible = showHarbor
 	if showHarbor then
 		keycap.Text = key
-		if refused == "full" then
+		if state:GetAttribute("PlaceRole") == "isle" then
+			-- isle (2026-10-16): the crew is landing on the lighthouse island; there is no ship to board here
+			local arrived = state:GetAttribute("IsleArrived") or 0
+			local expected = math.max(state:GetAttribute("IsleExpected") or 0, arrived)
+			harborEyebrow.TextColor3 = if sailing and left <= 5 then C.StateWarning else C.AccentLighthouse
+			if sailing then
+				harborEyebrow.Text = "LIGHTHOUSE ISLE \u{00B7} THE STORM STARTS IN " .. clock(left)
+				harborBody.Text = "Your crew has landed. Stay by the lighthouse and get ready to keep the light alive."
+			else
+				harborEyebrow.Text = string.format("LIGHTHOUSE ISLE \u{00B7} YOUR CREW IS LANDING %d/%d", arrived, expected)
+				harborBody.Text = "Wait by the lighthouse. The storm starts when your crew has landed."
+			end
+		elseif refused == "full" then
 			harborEyebrow.Text = "CREW FULL · " .. seats
 			harborEyebrow.TextColor3 = C.StateWarning
 			harborBody.Text = "Crew full. Find another ship and sail, or wait here for the next voyage."

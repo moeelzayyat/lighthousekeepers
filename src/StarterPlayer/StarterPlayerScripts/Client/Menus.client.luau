@@ -1271,7 +1271,10 @@ task.spawn(function()
 		setBlocking(false)
 		ContextActionService:UnbindAction("MenusBack")
 		ContextActionService:UnbindAction("MenusSteps")
-		coverText.Text = "The storm is coming. The light needs a keeper."
+		local note = player:GetAttribute("RouteNote")
+		coverText.Text = if note == "isle" then "Landing on Lighthouse Isle. The storm is coming."
+			elseif note == "return" then "Back at the harbor. Walk onto a ship to sail again."
+			else "The storm is coming. The light needs a keeper."
 		task.wait(2.2)
 		tween(cover, 0.6, { BackgroundTransparency = 1 })
 		tween(coverText, 0.4, { TextTransparency = 1 })

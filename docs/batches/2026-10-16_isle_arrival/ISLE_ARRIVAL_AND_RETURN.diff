@@ -1,0 +1,153 @@
+diff --git a/src/ReplicatedStorage/Shared/Config.luau b/src/ReplicatedStorage/Shared/Config.luau
+index 5c92575..4aa3c86 100644
+--- a/src/ReplicatedStorage/Shared/Config.luau
++++ b/src/ReplicatedStorage/Shared/Config.luau
+@@ -194,9 +194,9 @@ Config.MULTISHIP_TEST = {
+ 	gameId = 10771229467, -- "LK Multiship Test" (created by the owner 2026-10-16; verified in Studio)
+ 	harborPlaceId = 125998212495899, -- its Harbor (start) place
+ 	islePlaceId = 111423375237885, -- its Lighthouse Isle place (verified via GetGamePlacesAsync)
+-	multiShip = false, -- two ships in the harbor (Studio-safe; departures are simulated while teleport is off)
+-	sessionLock = false, -- PlayerData uses SessionLock on the TEST store (real DataStore writes: owner approval)
+-	teleport = false, -- real voyages to reserved Isle servers (owner approval)
++	multiShip = true, -- two ships in the harbor (Studio-safe; departures are simulated while teleport is off)
++	sessionLock = true, -- PlayerData uses SessionLock on the TEST store (real DataStore writes: owner approval)
++	teleport = true, -- real voyages to reserved Isle servers (owner approval)
+ 	-- the ONLY keys the session-locked PlayerData may write (stage 1: the owner's account). Anyone else plays from
+ 	-- memory only and is never saved.
+ 	writableUserIds = { 11752219158 },
+diff --git a/src/ServerScriptService/Server/IsleAdmission.luau b/src/ServerScriptService/Server/IsleAdmission.luau
+index 39c7c84..da01bcf 100644
+--- a/src/ServerScriptService/Server/IsleAdmission.luau
++++ b/src/ServerScriptService/Server/IsleAdmission.luau
+@@ -13,6 +13,8 @@
+ --   * Once the voyage is frozen, nobody else joins it: a late arrival (listed or not) is sent back to the harbor
+ --     and is never Ready, so it never earns run rewards. If nobody arrives, no voyage starts.
+ --   * Play Again: the players who chose it sail again in this same server (GameState's rematch flow).
++--   * Arrival (2026-10-16): deps.report(arrived, expected) is called while the crew is landing, so the client can
++--     show "your crew is landing n/m" instead of the copied harbor's boarding card.
+ 
+ local Players = game:GetService("Players")
+ local ReplicatedStorage = game:GetService("ReplicatedStorage")
+@@ -128,6 +130,9 @@ function IsleAdmission.requested()
+ 		return false
+ 	end
+ 	local list = admitted()
++	if deps.report then
++		deps.report(#list, expectedCount)
++	end
+ 	if #list == 0 then
+ 		return false -- nobody here (yet): no voyage
+ 	end
+diff --git a/src/ServerScriptService/Server/Main.server.luau b/src/ServerScriptService/Server/Main.server.luau
+index 86b735c..576e37f 100644
+--- a/src/ServerScriptService/Server/Main.server.luau
++++ b/src/ServerScriptService/Server/Main.server.luau
+@@ -65,6 +65,11 @@ local refs = IslandBuilder.build()
+ local lobbyRefs = LobbyBuilder.build(refs) -- the pirate-ship lobby (also moves the Quartermaster aboard)
+ -- harbor role: more departure ships, each with its own BoardingZone and wheel ({ [shipId] = refs })
+ local extraShips = if ROLE == "harbor" then LobbyBuilder.buildExtraShips(lobbyRefs) else {}
++if ROLE == "isle" then
++	-- isle (2026-10-16): travellers land on the lighthouse island itself, never in this place's copy of the harbor
++	lobbyRefs.spawn.CFrame = lobbyRefs.islandArrival
++end
++stateFolder:SetAttribute("PlaceRole", ROLE) -- the client words its cards for the harbor or the isle
+ LampService.init(refs, stateFolder, remotes)
+ TowerService.init(stateFolder, refs.repairPrompt, LampService.notify)
+ PlayerData.init(remotes, LampService.notify)
+@@ -736,7 +741,10 @@ local function chooseRoute(player)
+ 		return
+ 	end
+ 	local profileState = player:GetAttribute("ProfileState")
++	-- harbor: a player back from a voyage goes straight to the harbor (the title is for new joins only)
++	local returning = ROLE == "harbor" and PlaceRole.arrivedFromIsle(player:GetJoinData())
+ 	local fast = ROLE == "isle" -- isle: the crew arrives straight from the harbor, no title screen
++		or returning
+ 		or (Config.FIRST_VOYAGE_FAST_PATH == true
+ 			and (profileState == "saved" or profileState == "memory")
+ 			and player:GetAttribute("RunsCompleted") == 0
+@@ -753,12 +761,15 @@ local function chooseRoute(player)
+ 	if player.Parent ~= Players then
+ 		return
+ 	end
++	player:SetAttribute("RouteNote", if ROLE == "isle" then "isle" elseif returning then "return" else nil) -- the client's cover text
+ 	player:SetAttribute("Route", "fast")
+ 	player:SetAttribute("InLobby", true)
+-	EventLog.log("EnteredLobby", { player = player.Name, via = "first voyage" })
++	EventLog.log("EnteredLobby", { player = player.Name, via = if returning then "voyage return" else "first voyage" })
+ 	task.wait(0.4)
+ 	if ROLE ~= "isle" and player.Parent == Players and not player:GetAttribute("Ready") then
+-		LampService.notify(player, "The storm is coming and the light needs keepers. Walk onto the ship to join the crew.")
++		LampService.notify(player, if returning
++			then "Welcome back to the harbor. Walk onto a ship to sail again."
++			else "The storm is coming and the light needs keepers. Walk onto the ship to join the crew.")
+ 	end
+ end
+ Players.PlayerAdded:Connect(function(player)
+@@ -937,6 +948,10 @@ if ROLE == "isle" then
+ 		capacity = Config.MAX_CREW or 4,
+ 		now = os.time,
+ 		log = EventLog.log,
++		report = function(arrived, expected)
++			stateFolder:SetAttribute("IsleArrived", arrived)
++			stateFolder:SetAttribute("IsleExpected", expected)
++		end,
+ 		sendToHarbor = function(player)
+ 			if not Voyages.returnToHarbor(player) then
+ 				player:Kick("This Lighthouse Isle voyage belongs to another crew.")
+diff --git a/src/ServerScriptService/Server/PlaceRole.luau b/src/ServerScriptService/Server/PlaceRole.luau
+index d3d1bdf..2444d33 100644
+--- a/src/ServerScriptService/Server/PlaceRole.luau
++++ b/src/ServerScriptService/Server/PlaceRole.luau
+@@ -22,4 +22,11 @@ function PlaceRole.get()
+ 	return "harbor"
+ end
+ 
++-- Harbor (2026-10-16): did this player arrive by teleport from the Lighthouse Isle place (the end of a voyage)?
++-- joinData is Player:GetJoinData(); SourcePlaceId is filled in by Roblox for teleports. Used only to skip the title
++-- screen, so a wrong answer can never grant anything.
++function PlaceRole.arrivedFromIsle(joinData)
++	return type(joinData) == "table" and Config.ISLE_PLACE_ID ~= 0 and joinData.SourcePlaceId == Config.ISLE_PLACE_ID
++end
++
+ return PlaceRole
+diff --git a/src/StarterPlayer/StarterPlayerScripts/Client/Departure.client.luau b/src/StarterPlayer/StarterPlayerScripts/Client/Departure.client.luau
+index 81a34fb..8951d40 100644
+--- a/src/StarterPlayer/StarterPlayerScripts/Client/Departure.client.luau
++++ b/src/StarterPlayer/StarterPlayerScripts/Client/Departure.client.luau
+@@ -423,7 +423,19 @@ local function render()
+ 	harbor.Visible = showHarbor
+ 	if showHarbor then
+ 		keycap.Text = key
+-		if refused == "full" then
++		if state:GetAttribute("PlaceRole") == "isle" then
++			-- isle (2026-10-16): the crew is landing on the lighthouse island; there is no ship to board here
++			local arrived = state:GetAttribute("IsleArrived") or 0
++			local expected = math.max(state:GetAttribute("IsleExpected") or 0, arrived)
++			harborEyebrow.TextColor3 = if sailing and left <= 5 then C.StateWarning else C.AccentLighthouse
++			if sailing then
++				harborEyebrow.Text = "LIGHTHOUSE ISLE \u{00B7} THE STORM STARTS IN " .. clock(left)
++				harborBody.Text = "Your crew has landed. Stay by the lighthouse and get ready to keep the light alive."
++			else
++				harborEyebrow.Text = string.format("LIGHTHOUSE ISLE \u{00B7} YOUR CREW IS LANDING %d/%d", arrived, expected)
++				harborBody.Text = "Wait by the lighthouse. The storm starts when your crew has landed."
++			end
++		elseif refused == "full" then
+ 			harborEyebrow.Text = "CREW FULL · " .. seats
+ 			harborEyebrow.TextColor3 = C.StateWarning
+ 			harborBody.Text = "Crew full. Find another ship and sail, or wait here for the next voyage."
+diff --git a/src/StarterPlayer/StarterPlayerScripts/Client/Menus.client.luau b/src/StarterPlayer/StarterPlayerScripts/Client/Menus.client.luau
+index eabf302..46a3e46 100644
+--- a/src/StarterPlayer/StarterPlayerScripts/Client/Menus.client.luau
++++ b/src/StarterPlayer/StarterPlayerScripts/Client/Menus.client.luau
+@@ -1271,7 +1271,10 @@ task.spawn(function()
+ 		setBlocking(false)
+ 		ContextActionService:UnbindAction("MenusBack")
+ 		ContextActionService:UnbindAction("MenusSteps")
+-		coverText.Text = "The storm is coming. The light needs a keeper."
++		local note = player:GetAttribute("RouteNote")
++		coverText.Text = if note == "isle" then "Landing on Lighthouse Isle. The storm is coming."
++			elseif note == "return" then "Back at the harbor. Walk onto a ship to sail again."
++			else "The storm is coming. The light needs a keeper."
+ 		task.wait(2.2)
+ 		tween(cover, 0.6, { BackgroundTransparency = 1 })
+ 		tween(coverText, 0.4, { TextTransparency = 1 })

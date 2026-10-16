@@ -13,6 +13,8 @@
 --   * Once the voyage is frozen, nobody else joins it: a late arrival (listed or not) is sent back to the harbor
 --     and is never Ready, so it never earns run rewards. If nobody arrives, no voyage starts.
 --   * Play Again: the players who chose it sail again in this same server (GameState's rematch flow).
+--   * Arrival (2026-10-16): deps.report(arrived, expected) is called while the crew is landing, so the client can
+--     show "your crew is landing n/m" instead of the copied harbor's boarding card.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -128,6 +130,9 @@ function IsleAdmission.requested()
 		return false
 	end
 	local list = admitted()
+	if deps.report then
+		deps.report(#list, expectedCount)
+	end
 	if #list == 0 then
 		return false -- nobody here (yet): no voyage
 	end

@@ -65,6 +65,11 @@ local refs = IslandBuilder.build()
 local lobbyRefs = LobbyBuilder.build(refs) -- the pirate-ship lobby (also moves the Quartermaster aboard)
 -- harbor role: more departure ships, each with its own BoardingZone and wheel ({ [shipId] = refs })
 local extraShips = if ROLE == "harbor" then LobbyBuilder.buildExtraShips(lobbyRefs) else {}
+if ROLE == "isle" then
+	-- isle (2026-10-16): travellers land on the lighthouse island itself, never in this place's copy of the harbor
+	lobbyRefs.spawn.CFrame = lobbyRefs.islandArrival
+end
+stateFolder:SetAttribute("PlaceRole", ROLE) -- the client words its cards for the harbor or the isle
 LampService.init(refs, stateFolder, remotes)
 TowerService.init(stateFolder, refs.repairPrompt, LampService.notify)
 PlayerData.init(remotes, LampService.notify)
@@ -736,7 +741,10 @@ local function chooseRoute(player)
 		return
 	end
 	local profileState = player:GetAttribute("ProfileState")
+	-- harbor: a player back from a voyage goes straight to the harbor (the title is for new joins only)
+	local returning = ROLE == "harbor" and PlaceRole.arrivedFromIsle(player:GetJoinData())
 	local fast = ROLE == "isle" -- isle: the crew arrives straight from the harbor, no title screen
+		or returning
 		or (Config.FIRST_VOYAGE_FAST_PATH == true
 			and (profileState == "saved" or profileState == "memory")
 			and player:GetAttribute("RunsCompleted") == 0
@@ -753,12 +761,15 @@ local function chooseRoute(player)
 	if player.Parent ~= Players then
 		return
 	end
+	player:SetAttribute("RouteNote", if ROLE == "isle" then "isle" elseif returning then "return" else nil) -- the client's cover text
 	player:SetAttribute("Route", "fast")
 	player:SetAttribute("InLobby", true)
-	EventLog.log("EnteredLobby", { player = player.Name, via = "first voyage" })
+	EventLog.log("EnteredLobby", { player = player.Name, via = if returning then "voyage return" else "first voyage" })
 	task.wait(0.4)
 	if ROLE ~= "isle" and player.Parent == Players and not player:GetAttribute("Ready") then
-		LampService.notify(player, "The storm is coming and the light needs keepers. Walk onto the ship to join the crew.")
+		LampService.notify(player, if returning
+			then "Welcome back to the harbor. Walk onto a ship to sail again."
+			else "The storm is coming and the light needs keepers. Walk onto the ship to join the crew.")
 	end
 end
 Players.PlayerAdded:Connect(function(player)
@@ -937,6 +948,10 @@ if ROLE == "isle" then
 		capacity = Config.MAX_CREW or 4,
 		now = os.time,
 		log = EventLog.log,
+		report = function(arrived, expected)
+			stateFolder:SetAttribute("IsleArrived", arrived)
+			stateFolder:SetAttribute("IsleExpected", expected)
+		end,
 		sendToHarbor = function(player)
 			if not Voyages.returnToHarbor(player) then
 				player:Kick("This Lighthouse Isle voyage belongs to another crew.")
