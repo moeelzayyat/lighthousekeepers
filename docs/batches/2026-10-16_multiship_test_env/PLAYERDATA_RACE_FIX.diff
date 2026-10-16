@@ -1,0 +1,197 @@
+diff --git a/src/ServerScriptService/Server/PlayerData.luau b/src/ServerScriptService/Server/PlayerData.luau
+index 1f192bc..f89f388 100644
+--- a/src/ServerScriptService/Server/PlayerData.luau
++++ b/src/ServerScriptService/Server/PlayerData.luau
+@@ -28,6 +28,11 @@ local LOCKED = Config.IS_MULTISHIP_TEST and Config.SESSION_LOCK_ENABLED == true
+ local lock = nil -- SessionLock instance (test experience with sessionLock only)
+ local frozen = {} -- player -> profile parked during a hand-off (all mutators see no profile, so they refuse)
+ local WRITABLE = {} -- test experience: the only UserIds whose key may be written
++local generation = {} -- player -> number of mutations so far (fix B: a save only clears `dirty` for what it wrote)
++local loading = {} -- player -> true while load() is in flight
++local leftDuringLoad = {} -- player -> true if PlayerRemoving fired while load() was in flight (fix A)
++local RELEASE_RETRIES = 3
++local RELEASE_RETRY_WAIT = 1
+ if Config.IS_MULTISHIP_TEST then
+ 	for _, id in Config.MULTISHIP_TEST.writableUserIds or {} do
+ 		WRITABLE[id] = true
+@@ -109,19 +114,26 @@ local function push(player)
+ end
+ 
+ local function markChanged(player)
++	generation[player] = (generation[player] or 0) + 1
+ 	dirty[player] = true
+ 	push(player)
+ end
+ 
++-- Fix B: a save writes a SNAPSHOT taken at its start, and clears `dirty` only if no mutation happened while it was
++-- in flight. A newer change stays dirty and is written by the next save (or the release on leave / hand-off).
+ local function save(player)
+ 	local profile = profiles[player]
+ 	if not profile or not storeAvailable or not dirty[player] then
+ 		return
+ 	end
++	local savedGeneration = generation[player] or 0
++	local copy = snapshot(profile)
+ 	if LOCKED then
+-		local ok, why = lock:save(keyFor(player), profile)
++		local ok, why = lock:save(keyFor(player), copy)
+ 		if ok then
+-			dirty[player] = nil
++			if (generation[player] or 0) == savedGeneration then
++				dirty[player] = nil
++			end
+ 		else
+ 			warn("PlayerData: locked save failed for " .. player.Name .. ": " .. tostring(why))
+ 			if why == "lock lost" then
+@@ -132,25 +144,54 @@ local function save(player)
+ 	end
+ 	local ok, err = pcall(function()
+ 		store:UpdateAsync(keyFor(player), function()
+-			return profile
++			return copy
+ 		end)
+ 	end)
+ 	if ok then
+-		dirty[player] = nil
++		if (generation[player] or 0) == savedGeneration then
++			dirty[player] = nil
++		end
+ 	else
+ 		warn("PlayerData: save failed for " .. player.Name .. ": " .. tostring(err))
+ 	end
+ end
+ 
++-- Fix A: release a lock that was acquired for a player who has already left (claim still in flight at leave).
++-- Retried a few times; if every attempt fails the session simply goes stale and can be taken over later.
++local function releaseAbandoned(player, value)
++	for attempt = 1, RELEASE_RETRIES do
++		local ok, released = pcall(function()
++			return (lock:release(keyFor(player), value))
++		end)
++		if ok and released then
++			return true
++		end
++		if not lock:owns(keyFor(player)) then
++			return true -- nothing of ours left to release (fenced or already released)
++		end
++		if attempt < RELEASE_RETRIES then
++			task.wait(RELEASE_RETRY_WAIT)
++		end
++	end
++	warn("PlayerData: could not release the abandoned session of " .. player.Name .. "; it expires after the stale timeout.")
++	return false
++end
++
+ local function load(player)
+ 	local profile
++	loading[player] = true
+ 	if storeAvailable and LOCKED and not WRITABLE[player.UserId] then
+ 		-- test experience: not an allow-listed key -> memory only, never written
+ 		profile = newProfile()
+ 		profile.doNotSave = true
+ 	elseif storeAvailable and LOCKED then
+ 		local ok, value, why = lock:claim(keyFor(player), newProfile())
+-		if ok then
++		if ok and (leftDuringLoad[player] or player.Parent ~= Players) then
++			-- fix A: the player left while the claim was in flight and it succeeded anyway: give the lock back
++			loading[player], leftDuringLoad[player] = nil, nil
++			releaseAbandoned(player, value)
++			return
++		elseif ok then
+ 			profile = reconcile(value)
+ 		else
+ 			warn("PlayerData: could not claim " .. player.Name .. " (" .. tostring(why) .. "); progress this session will NOT be saved.")
+@@ -178,8 +219,10 @@ local function load(player)
+ 	else
+ 		profile = newProfile()
+ 	end
+-	if player.Parent ~= Players then
+-		return -- left while loading
++	local left = leftDuringLoad[player] or player.Parent ~= Players
++	loading[player], leftDuringLoad[player] = nil, nil
++	if left then
++		return -- left while loading (a session lock taken meanwhile was released above)
+ 	end
+ 	profiles[player] = profile
+ 	-- Read-only signals for the first-voyage route and coach (launch R2/R3). Nothing new is saved.
+@@ -358,6 +401,49 @@ function PlayerData.reclaim(player)
+ 	return true
+ end
+ 
++-- Leaving. Locked path: the profile is detached first (so no mutation can slip in after the final write), then the
++-- release writes the latest state. A claim still in flight is marked so load() gives its lock back (fix A).
++function PlayerData._onRemoving(player)
++	if loading[player] then
++		leftDuringLoad[player] = true
++	end
++	local profile = profiles[player]
++	if LOCKED and storeAvailable then
++		profiles[player] = nil
++		if profile and not profile.doNotSave then
++			lock:release(keyFor(player), profile)
++		elseif frozen[player] and lock:owns(keyFor(player)) then
++			lock:release(keyFor(player), frozen[player]) -- a hand-off whose release failed: release it now
++		end
++		frozen[player] = nil
++	elseif profile and not profile.doNotSave then
++		save(player)
++	end
++	profiles[player] = nil
++	dirty[player] = nil
++	generation[player] = nil
++end
++
++-- Deterministic test seam (fake store, stand-in players). Never called by the game itself.
++PlayerData._test = {
++	useLockedStore = function(fakeStore, lockOptions, writableIds)
++		store, storeAvailable, LOCKED = fakeStore, true, true
++		local opts = table.clone(lockOptions or {})
++		opts.store = fakeStore
++		lock = require(script.Parent.SessionLock).new(opts)
++		for _, id in writableIds or {} do
++			WRITABLE[id] = true
++		end
++		RELEASE_RETRY_WAIT = 0
++		return lock
++	end,
++	load = function(player) return load(player) end,
++	save = function(player) return save(player) end,
++	markChanged = function(player) return markChanged(player) end,
++	profiles = profiles,
++	dirty = dirty,
++}
++
+ function PlayerData.init(remoteFolder, notify)
+ 	remotes = remoteFolder
+ 
+@@ -416,29 +502,11 @@ function PlayerData.init(remoteFolder, notify)
+ 			push(player)
+ 		end
+ 	end)
+-	local lastAction = {} -- (kept for cleanup on leave)
+-
+ 	Players.PlayerAdded:Connect(load)
+ 	for _, player in Players:GetPlayers() do
+ 		task.spawn(load, player)
+ 	end
+-	Players.PlayerRemoving:Connect(function(player)
+-		local profile = profiles[player]
+-		if LOCKED and storeAvailable then
+-			-- frozen (handed off) players already released their save; everyone else releases it now
+-			if profile and not profile.doNotSave then
+-				lock:release(keyFor(player), profile)
+-			elseif frozen[player] and lock:owns(keyFor(player)) then
+-				lock:release(keyFor(player), frozen[player]) -- a hand-off whose release failed: release it now
+-			end
+-			frozen[player] = nil
+-		elseif profile and not profile.doNotSave then
+-			save(player)
+-		end
+-		profiles[player] = nil
+-		dirty[player] = nil
+-		lastAction[player] = nil
+-	end)
++	Players.PlayerRemoving:Connect(PlayerData._onRemoving)
+ 	game:BindToClose(function()
+ 		for player, profile in profiles do
+ 			if not profile.doNotSave then
