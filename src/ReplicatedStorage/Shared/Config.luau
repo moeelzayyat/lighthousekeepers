@@ -197,6 +197,10 @@ Config.MULTISHIP_TEST = {
 	multiShip = false, -- two ships in the harbor (Studio-safe; departures are simulated while teleport is off)
 	sessionLock = false, -- PlayerData uses SessionLock on the TEST store (real DataStore writes: owner approval)
 	teleport = false, -- real voyages to reserved Isle servers (owner approval)
+	-- the ONLY keys the session-locked PlayerData may write (stage 1: the owner's account). Anyone else plays from
+	-- memory only and is never saved.
+	writableUserIds = { 11752219158 },
+	stage1Pearls = 25, -- the one deterministic Pearl change of the stage 1 test (Studio-only hook)
 }
 Config.IS_MULTISHIP_TEST = Config.MULTISHIP_TEST.gameId ~= 0 and game.GameId == Config.MULTISHIP_TEST.gameId
 if Config.IS_MULTISHIP_TEST then

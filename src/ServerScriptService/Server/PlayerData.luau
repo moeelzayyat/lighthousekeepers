@@ -27,6 +27,12 @@ local STORE_NAME = if Config.IS_MULTISHIP_TEST then "LKMS_TEST_PlayerData_v1" el
 local LOCKED = Config.IS_MULTISHIP_TEST and Config.SESSION_LOCK_ENABLED == true
 local lock = nil -- SessionLock instance (test experience with sessionLock only)
 local frozen = {} -- player -> profile parked during a hand-off (all mutators see no profile, so they refuse)
+local WRITABLE = {} -- test experience: the only UserIds whose key may be written
+if Config.IS_MULTISHIP_TEST then
+	for _, id in Config.MULTISHIP_TEST.writableUserIds or {} do
+		WRITABLE[id] = true
+	end
+end
 local SCHEMA_VERSION = 1
 local AUTOSAVE_SECONDS = 60
 
@@ -138,7 +144,11 @@ end
 
 local function load(player)
 	local profile
-	if storeAvailable and LOCKED then
+	if storeAvailable and LOCKED and not WRITABLE[player.UserId] then
+		-- test experience: not an allow-listed key -> memory only, never written
+		profile = newProfile()
+		profile.doNotSave = true
+	elseif storeAvailable and LOCKED then
 		local ok, value, why = lock:claim(keyFor(player), newProfile())
 		if ok then
 			profile = reconcile(value)
@@ -361,6 +371,31 @@ function PlayerData.init(remoteFolder, notify)
 		storeAvailable = true
 		if LOCKED then
 			lock = require(script.Parent.SessionLock).new({ store = store })
+			-- STAGE 1 TEST HOOK (Studio + test experience + session lock only): one fixed Pearl change and a status
+			-- read for an allow-listed player, invoked from the Studio server command line. Not created anywhere else.
+			if game:GetService("RunService"):IsStudio() then
+				local hook = Instance.new("BindableFunction")
+				hook.Name = "LKMS_Stage1"
+				hook.OnInvoke = function(op, userId)
+					local player = Players:GetPlayerByUserId(userId)
+					if not player or not WRITABLE[userId] then
+						return { error = "not an allow-listed player in this server" }
+					end
+					if op == "addTestPearls" then
+						PlayerData.addPearls(player, Config.MULTISHIP_TEST.stage1Pearls, "stage1-test")
+					elseif op ~= "status" then
+						return { error = "unknown op" }
+					end
+					local profile = profiles[player]
+					return {
+						pearls = profile and profile.pearls,
+						dirty = dirty[player] == true,
+						owned = lock:owns(keyFor(player)),
+						profileState = player:GetAttribute("ProfileState"),
+					}
+				end
+				hook.Parent = game:GetService("ServerStorage")
+			end
 		end
 	else
 		warn("PlayerData: DataStores unavailable (" .. tostring(result) .. "). Progress is kept in memory only. In Studio, enable Game Settings > Security > Enable Studio Access to API Services.")
