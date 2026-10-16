@@ -1,5 +1,10 @@
 # Stage 2 authorization package: first real test voyage (2026-10-16)
 
+**Revision 2:** the auditor's review of 1b49741 is folded in.
+- The reclaim fix is accepted.
+- The `_test` guard is accepted **by source inspection only**. It was not runtime-tested on a live server.
+- Corrections 1 and 2 are applied below: Results through the real game loop, and the published-place preflight.
+
 **Status:** prepared, **not executed**.
 - Nothing has been published.
 - No real DataStore or MemoryStore writes have been made.
@@ -105,9 +110,10 @@ multiShip = true, sessionLock = true, teleport = true
 | 0 | Owner | Approve this Stage 2 scope | — |
 | 1 | Owner | In the **LK Multiship Test** window: File > Save to File. Name it `LKMS_TEST_harbor_2026-10-16_pre-stage2.rbxl` in `backups\2026-10-16\`. | I hash the file and Rojo-check that it equals git. |
 | 2 | Me | `list_roblox_studios`, then assert `GameId 10771229467, PlaceId 125998212495899`. Set the three switches to true. Commit to `multiship-test`. | Config = `94ee135c…`. PlayerData, SessionLock and Voyages = git. API off. |
-| 3 | Owner | **File > Publish to Roblox** (Harbor 125998212495899) | The Studio title stays LK Multiship Test. |
-| 4 | Owner | **File > Publish to Roblox As… > LK Multiship Test > Lighthouse Isle** > overwrite | I re-list studios and assert the window is now **GameId 10771229467, PlaceId 111423375237885**. All 49 hashes equal git, with switches on. |
-| 5 | Owner | **Shut Down All Servers** for LK Multiship Test (section 4) | — |
+| 3 | Owner | **File > Publish to Roblox**. **Exact target:** experience **LK Multiship Test** (10771229467), place **LK Multiship Test / Harbor, 125998212495899**, which is the start place. Never Lighthouse Keepers - Staging. | Immediately before: I assert the window's `GameId 10771229467, PlaceId 125998212495899`, check that all 49 hashes equal git with switches on, and confirm `PlaceRole` resolves to `"harbor"` (`PLACE_ROLE_OVERRIDE` = nil; the role comes from the PlaceId). |
+| 4 | Owner | **No joining the experience between the two publishes.** Then **File > Publish to Roblox As… > LK Multiship Test > Lighthouse Isle**, overwrite. **Exact target:** place **Lighthouse Isle, 111423375237885**. | Afterwards, I re-list studios and assert the window is **GameId 10771229467, PlaceId 111423375237885**. All 49 hashes equal git with switches on, and `PlaceRole` resolves to `"isle"`. |
+| 5 | Owner | **Shut Down All Servers** for LK Multiship Test (section 4), after both publishes | — |
+| 5a | Me | **Teleport preflight:** within-universe server teleports need no extra setting. "Allow Third Party Teleports" only covers *other* experiences. The public universe record `develop.roblox.com/v1/universes/10771229467/places` lists exactly **Lighthouse Isle 111423375237885** and **LK Multiship Test 125998212495899**, with `rootPlaceId` 125998212495899, `privacyType` **Private** and creator 11752219158 (checked today). I re-check it after the publishes. | The experience stays **Private** throughout. |
 | 6 | Owner | Turn **Studio API access on** (in that window's Experience Settings > Security) | My first uncached read, R0, below |
 
 ## 6. Bounded test procedure (one crew, one voyage, owner's account only)
@@ -120,8 +126,8 @@ There is no second crew, no second account and no forced failure. At each checkp
 | 1 | Join LK Multiship Test from roblox.com (Harbor) | **Claim token T1**, job = Harbor JobId, pearls 25. The HUD shows 25. |
 | 2 | Board **Ship1** and press **SAIL NOW** (alone, 1/4), then wait out the countdown | Harbor F9 server log: `[EVT] DepartureStarted` (ship 1, mode manual) and `[EVT] VoyageLaunched … mode teleport server <privateServerId>`. No `TeleportFailed`. |
 | 3 | Arrive in the reserved Isle server | Store: hand-off **release** (session cleared, pearls 25), then **Isle claim token T2 ≠ T1** with job = Isle JobId. **Manifest check (MemoryStore):** Isle F9 server log `[EVT] IsleVoyage crew 1 expected 1`, and **no** `IsleRefused` / `IsleClosed`. Optional, in the Isle server console: `game.PrivateServerId` equals the Harbor log's server id. |
-| 4 | Play the Prologue and reach **Results** | The Pearls shown on Results. Owned saves and heartbeats stay under T2 (versions advance and the token is unchanged). |
-| 5 | Choose **back to harbor** on Results | Store: Isle **release** (session cleared, Results pearls), then **Harbor claim T3 ≠ T2**. The Harbor HUD Pearls equal the stored pearls equal 25 + the Prologue award. |
+| 4 | Play the Prologue (it awards no Pearls), then **survive Night 1** (log `[EVT] NightSurvived night 1`). On **Night 2**, end the run through normal play: stop refuelling the lamp until it stays dark for the grace period, a **blackout** Defeat. **No shop, Quartermaster or Trader purchases or sales**, and no boss loot (big monsters only come on nights 4, 7, 10 and 13). | **Expected Results award** (`GameState`): Defeat on night 2 counts 1 night survived × `PEARLS_PER_NIGHT` 1 = **1 Pearl**. I record the exact figure shown on Results and the `run` addPearls. Saves and heartbeats stay under T2: versions advance and the token is unchanged. |
+| 5 | On Results choose **Main Menu** (or let the timer run out without Play Again). Both send the player back to the harbor. | Store: Isle **release** (session cleared, pearls = 25 + award), then **Harbor claim T3 ≠ T2**. The Harbor HUD Pearls = stored pearls = **25 + the exact Results award** (expected 26). |
 | 6 | Leave the game | **Final release:** session `nil`, pearls unchanged. The version list shows the full claim → save/heartbeat → release chain, with one owner at a time. |
 | 7 | Owner | Turn Studio API access **off**. I confirm with the rejected probe. |
 
@@ -140,14 +146,15 @@ There is no second crew, no second account and no forced failure. At each checkp
 - `IsleRefused`
 - a kick message
 - a stored session held by two jobs
-- unexpected Pearls
+- an invalid manifest
+- an unexplained profile value, including any Pearls other than 25 + the recorded award
+- an overlapping lock
 
-I then record the state and stop for review.
+I then record the state and stop for review. **No retry and no second voyage without new authorization.**
 
 **Known uncertainty:** Roblox docs don't say whether `ReserveServer` / `TeleportAsync` work for the creator in a **Private** experience.
-- If they don't, step 2 fails naturally.
-- The accepted recovery path then re-claims the save in the Harbor.
-- That is evidence to report, not a test to repeat.
+- If Roblox refuses the teleport, **stop**. I record the error, the recovery that ran (re-claim or disconnect) and the resulting save ownership.
+- The experience is **never** made public, and nothing is retried, without new authorization.
 
 ## 7. After the test
 
@@ -161,4 +168,10 @@ I then record the state and stop for review.
 
 ## Required owner decision
 
-Approve Stage 2 exactly as above: steps 1–7 of section 5 and the procedure in section 6. Until then, nothing is published, no switch is turned on and no write is made.
+Approve Stage 2 exactly as above: steps 1–6 of section 5 and the procedure in section 6.
+- **Authorized boundary:**
+  - universe 10771229467; Harbor 125998212495899; Isle 111423375237885;
+  - DataStore `LKMS_TEST_PlayerData_v1`, writable profile `player_11752219158` only;
+  - MemoryStore map `Voyages` only;
+  - exactly one Harbor → reserved Isle → Harbor round trip.
+- Until the owner's explicit yes, nothing is published, no switch is turned on and no write or teleport is made.
