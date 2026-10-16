@@ -1,0 +1,34 @@
+diff --git a/src/ServerScriptService/Server/PlayerData.luau b/src/ServerScriptService/Server/PlayerData.luau
+index f89f388..ad76fba 100644
+--- a/src/ServerScriptService/Server/PlayerData.luau
++++ b/src/ServerScriptService/Server/PlayerData.luau
+@@ -391,8 +391,16 @@ function PlayerData.reclaim(player)
+ 	if not LOCKED or not storeAvailable then
+ 		return false
+ 	end
++	loading[player] = true
+ 	local ok, value = lock:claim(keyFor(player), newProfile())
+-	if not ok or player.Parent ~= Players then
++	local left = leftDuringLoad[player] or player.Parent ~= Players
++	loading[player], leftDuringLoad[player] = nil, nil
++	if ok and left then
++		-- the player left while the re-claim was in flight and it succeeded anyway: give the lock back (as fix A)
++		frozen[player] = nil
++		releaseAbandoned(player, value)
++		return false
++	elseif not ok or left then
+ 		return false
+ 	end
+ 	frozen[player] = nil
+@@ -424,8 +432,9 @@ function PlayerData._onRemoving(player)
+ 	generation[player] = nil
+ end
+ 
+--- Deterministic test seam (fake store, stand-in players). Never called by the game itself.
+-PlayerData._test = {
++-- Deterministic test seam (fake store, stand-in players). Never called by the game itself, and only created in
++-- Studio: on live servers PlayerData._test is nil.
++PlayerData._test = if not game:GetService("RunService"):IsStudio() then nil else {
+ 	useLockedStore = function(fakeStore, lockOptions, writableIds)
+ 		store, storeAvailable, LOCKED = fakeStore, true, true
+ 		local opts = table.clone(lockOptions or {})
