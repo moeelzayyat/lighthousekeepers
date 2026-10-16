@@ -27,8 +27,12 @@
 --     recovered (re-claim, or disconnect to rejoin) and never left InTransit.
 --   * A teleport that was requested but never completed (no TeleportInitFailed, player still here) is recovered by a
 --     watchdog after TRANSIT_TIMEOUT seconds.
+--   * Attempt-specific recovery (2026-10-16, test experience): every journey carries a per-player attempt token; a
+--     watchdog or failure report of an older attempt is ignored; only one recovery per player runs at a time; save
+--     adapter calls (including the isle -> harbor hand-off) are bounded by ADAPTER_TIMEOUT.
 
 local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
@@ -38,6 +42,7 @@ local Voyages = {}
 local MANIFEST_MAP = "Voyages"
 local MANIFEST_SECONDS = 600
 local TRANSIT_TIMEOUT = 60 -- seconds after a teleport request before a still-present traveller is recovered
+local ADAPTER_TIMEOUT = 20 -- seconds a save hand-off or re-claim may take before it counts as failed
 
 local deps = nil
 
@@ -85,18 +90,47 @@ function Voyages.init(d)
 	end
 end
 
--- adapter calls never throw out of Voyages: an exception is a failure
-local function safeCall(fn, player)
-	local ok, result = pcall(fn, player)
-	if not ok then
-		deps.log("SaveAdapterError", { player = player.Name, err = tostring(result) })
+-- adapter calls never throw out of Voyages: an exception is a failure, and so is a call that does not return
+-- within `seconds` (a hand-off or re-claim that hangs can never hold a player forever)
+local function safeCall(fn, player, seconds)
+	local done, result = false, false
+	task.spawn(function()
+		local ok, value = pcall(fn, player)
+		if not ok then
+			deps.log("SaveAdapterError", { player = player.Name, err = tostring(value) })
+		end
+		result = ok and value == true
+		done = true
+	end)
+	local deadline = os.clock() + (seconds or deps.adapterTimeout or ADAPTER_TIMEOUT)
+	while not done and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	if not done then
+		deps.log("SaveAdapterTimeout", { player = player.Name })
 		return false
 	end
-	return result == true
+	return result
 end
 
 local function cancelled(ticket)
 	return ticket ~= nil and ticket.cancelled == true
+end
+
+-- Every journey (harbor -> isle, isle -> harbor) is one ATTEMPT with its own token on the player. Watchdogs and
+-- failure handlers carry the token of the attempt they belong to, so an old attempt can never act on a player who
+-- has since started a new one.
+local recovering = {} -- player -> true while a recovery runs (no two recoveries of one player at the same time)
+
+local function startAttempt(player)
+	local token = HttpService:GenerateGUID(false)
+	player:SetAttribute("VoyageAttempt", token)
+	player:SetAttribute("InTransit", true)
+	task.delay(deps.transitTimeout or TRANSIT_TIMEOUT, function()
+		-- watchdog of THIS attempt only: a hand-off or teleport step that hangs can never strand a player
+		Voyages.teleportFailed(player, "voyage did not complete in time", token)
+	end)
+	return token
 end
 
 local function simulate(shipId, crew)
@@ -116,30 +150,25 @@ function Voyages._teleport(shipId, crew, ticket)
 	local placeId = deps.services.testPlaceId or Config.ISLE_PLACE_ID
 
 	-- 1. out of the party at once: no second launch of these players, the ship is free for a new crew
+	local attempts = {}
 	for _, player in crew do
-		player:SetAttribute("InTransit", true)
 		deps.roster.leave(player, "travelling")
-		-- watchdog from the very start: a hand-off or teleport step that hangs can never strand a player
-		task.delay(deps.transitTimeout or TRANSIT_TIMEOUT, function()
-			if player.Parent == Players and player:GetAttribute("InTransit") then
-				Voyages.teleportFailed(player, "voyage did not complete in time")
-			end
-		end)
+		attempts[player] = startAttempt(player)
 	end
 	-- 2. awaited hand-off of every save; only successful members travel
 	local travelling = {}
 	for _, player in crew do
 		if cancelled(ticket) then
-			Voyages.teleportFailed(player, "launch cancelled")
+			Voyages.teleportFailed(player, "launch cancelled", attempts[player])
 		elseif player.Parent == Players and safeCall(deps.playerData.handoff, player) then
 			table.insert(travelling, player)
 		else
-			Voyages.teleportFailed(player, "save hand-off failed")
+			Voyages.teleportFailed(player, "save hand-off failed", attempts[player])
 		end
 	end
 	if cancelled(ticket) then -- timed out during the hand-offs: nobody travels on this launch
 		for _, player in travelling do
-			Voyages.teleportFailed(player, "launch cancelled")
+			Voyages.teleportFailed(player, "launch cancelled", attempts[player])
 		end
 		deps.log("VoyageCancelled", { ship = shipId, why = "launch timed out" })
 		return
@@ -162,34 +191,41 @@ function Voyages._teleport(shipId, crew, ticket)
 		deps.log("VoyageLaunched", { ship = shipId, crew = #travelling, mode = "teleport", server = privateServerId })
 		deps.services.teleport(placeId, travelling, options)
 	end)
-	if ok then
-		-- watchdog: a requested teleport that never completes must not leave anyone InTransit
+	if not ok then
 		for _, player in travelling do
-			task.delay(deps.transitTimeout or TRANSIT_TIMEOUT, function()
-				if player.Parent == Players and player:GetAttribute("InTransit") then
-					Voyages.teleportFailed(player, "teleport did not complete")
-				end
-			end)
-		end
-	else
-		for _, player in travelling do
-			Voyages.teleportFailed(player, tostring(err))
+			Voyages.teleportFailed(player, tostring(err), attempts[player])
 		end
 	end
+	-- on success the attempt's watchdog stays armed: a teleport that never completes is still recovered
 end
 
 -- A member who could not travel: stays in the harbor, out of any party, and must re-claim the save session.
-function Voyages.teleportFailed(player, why)
+-- `attempt`: the token of the journey that failed. A stale token (the player has started a new journey since) or a
+-- finished journey is ignored; TeleportInitFailed reports without a token and applies to the current journey.
+function Voyages.teleportFailed(player, why, attempt)
 	if player.Parent ~= Players or not player:GetAttribute("InTransit") then
-		return -- gone, or already handled (a pcall error and TeleportInitFailed can both report one failure)
+		return -- gone, or this journey is already over
 	end
+	local current = player:GetAttribute("VoyageAttempt")
+	if attempt ~= nil and attempt ~= current then
+		deps.log("StaleRecoveryIgnored", { player = player.Name, why = why })
+		return -- an old attempt's watchdog or failure: the player is on a newer journey now
+	end
+	if recovering[player] then
+		return -- a recovery is already re-claiming this profile
+	end
+	recovering[player] = true
 	deps.log("TeleportFailed", { player = player.Name, why = why })
 	if deps.roster.shipOf(player) ~= nil then
 		deps.roster.leave(player, "teleport failed")
 	end
 	local reclaimed = true
 	if deps.playerData and deps.playerData.reclaim then
-		reclaimed = safeCall(deps.playerData.reclaim, player) -- an exception counts as a failed re-claim
+		reclaimed = safeCall(deps.playerData.reclaim, player) -- exception or hang = failed re-claim
+	end
+	recovering[player] = nil
+	if player:GetAttribute("VoyageAttempt") ~= current then
+		return -- (cannot normally happen: a new journey needs InTransit cleared first)
 	end
 	if not reclaimed then
 		deps.log("ReclaimFailed", { player = player.Name })
@@ -197,6 +233,7 @@ function Voyages.teleportFailed(player, why)
 		return
 	end
 	player:SetAttribute("InTransit", nil)
+	player:SetAttribute("VoyageAttempt", nil)
 	deps.notify(player, "The ship couldn't reach Lighthouse Isle. You're still in the harbor: walk aboard a ship to try again.")
 end
 
@@ -219,20 +256,17 @@ function Voyages.returnToHarbor(player)
 		warn("[Voyages] save hand-off adapter not wired: not teleporting " .. player.Name)
 		return false
 	end
-	player:SetAttribute("InTransit", true)
-	if not safeCall(deps.playerData.handoff, player) then
-		Voyages.teleportFailed(player, "save hand-off failed")
+	if player:GetAttribute("InTransit") then
+		return true -- already on a journey
+	end
+	local attempt = startAttempt(player)
+	if not safeCall(deps.playerData.handoff, player) then -- bounded: a hanging hand-off fails after the timeout
+		Voyages.teleportFailed(player, "save hand-off failed", attempt)
 		return true
 	end
 	local ok, err = pcall(deps.services.teleport, Config.HARBOR_PLACE_ID, { player }, nil)
 	if not ok then
-		Voyages.teleportFailed(player, tostring(err))
-	else
-		task.delay(deps.transitTimeout or TRANSIT_TIMEOUT, function()
-			if player.Parent == Players and player:GetAttribute("InTransit") then
-				Voyages.teleportFailed(player, "teleport did not complete")
-			end
-		end)
+		Voyages.teleportFailed(player, tostring(err), attempt)
 	end
 	return true
 end

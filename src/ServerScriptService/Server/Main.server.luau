@@ -908,7 +908,9 @@ Voyages.init({
 	notify = LampService.notify,
 	log = EventLog.log,
 	roster = ShipRoster,
-	playerData = nil, -- the save hand-off adapter (SessionLock) is NOT wired: Voyages refuses to teleport without it
+	-- the save hand-off adapter: only in the multi-ship TEST experience with its session lock on; otherwise nil and
+	-- Voyages refuses to teleport
+	playerData = if Config.IS_MULTISHIP_TEST and Config.SESSION_LOCK_ENABLED then PlayerData else nil,
 	sendToHarbor = function(player)
 		task.spawn(moveCharacterTo, player, lobbyRefs.spawn.CFrame)
 	end,

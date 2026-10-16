@@ -5,6 +5,12 @@
 -- without API access), profiles live in memory only and a warning is printed.
 --
 -- All changes go through this module on the server. Clients only ever *request* actions.
+--
+-- MULTI-SHIP TEST EXPERIENCE ONLY (branch multiship-test): when Config.IS_MULTISHIP_TEST, the store is
+-- "LKMS_TEST_PlayerData_v1" (never the production store), and when Config.SESSION_LOCK_ENABLED as well, every
+-- read/write goes through SessionLock (claim on join, owned saves + heartbeat, release on leave/close) and the
+-- profile can be handed off to another server (freeze + awaited release) and re-claimed. The profile format is
+-- unchanged. In production neither condition can be true, so this module behaves exactly as before.
 
 local Players = game:GetService("Players")
 local DataStoreService = game:GetService("DataStoreService")
@@ -17,7 +23,10 @@ local EventLog = require(script.Parent.EventLog)
 
 local PlayerData = {}
 
-local STORE_NAME = "LighthouseKeepers_PlayerData_v1"
+local STORE_NAME = if Config.IS_MULTISHIP_TEST then "LKMS_TEST_PlayerData_v1" else "LighthouseKeepers_PlayerData_v1"
+local LOCKED = Config.IS_MULTISHIP_TEST and Config.SESSION_LOCK_ENABLED == true
+local lock = nil -- SessionLock instance (test experience with sessionLock only)
+local frozen = {} -- player -> profile parked during a hand-off (all mutators see no profile, so they refuse)
 local SCHEMA_VERSION = 1
 local AUTOSAVE_SECONDS = 60
 
@@ -103,6 +112,18 @@ local function save(player)
 	if not profile or not storeAvailable or not dirty[player] then
 		return
 	end
+	if LOCKED then
+		local ok, why = lock:save(keyFor(player), profile)
+		if ok then
+			dirty[player] = nil
+		else
+			warn("PlayerData: locked save failed for " .. player.Name .. ": " .. tostring(why))
+			if why == "lock lost" then
+				profile.doNotSave = true -- another server owns this save now: never write again from here
+			end
+		end
+		return
+	end
 	local ok, err = pcall(function()
 		store:UpdateAsync(keyFor(player), function()
 			return profile
@@ -117,7 +138,16 @@ end
 
 local function load(player)
 	local profile
-	if storeAvailable then
+	if storeAvailable and LOCKED then
+		local ok, value, why = lock:claim(keyFor(player), newProfile())
+		if ok then
+			profile = reconcile(value)
+		else
+			warn("PlayerData: could not claim " .. player.Name .. " (" .. tostring(why) .. "); progress this session will NOT be saved.")
+			profile = newProfile()
+			profile.doNotSave = true
+		end
+	elseif storeAvailable then
 		for attempt = 1, 3 do
 			local ok, result = pcall(function()
 				return store:GetAsync(keyFor(player))
@@ -284,6 +314,40 @@ end
 -- Setup
 ---------------------------------------------------------------------
 
+-- Multi-ship hand-off (test experience with sessionLock only). Freeze, then an awaited final save + release.
+-- Returns true only when the release is confirmed; on false the profile stays frozen until reclaim().
+function PlayerData.handoff(player)
+	if not LOCKED or not storeAvailable then
+		return false
+	end
+	local profile = profiles[player] or frozen[player]
+	if not profile or profile.doNotSave then
+		return false
+	end
+	frozen[player] = profile
+	profiles[player] = nil -- frozen: every mutator now sees no profile and refuses
+	local ok = lock:release(keyFor(player), profile)
+	if ok then
+		dirty[player] = nil
+	end
+	return ok == true
+end
+
+-- Re-claim after a failed voyage: the stored profile becomes the live one again (unfrozen).
+function PlayerData.reclaim(player)
+	if not LOCKED or not storeAvailable then
+		return false
+	end
+	local ok, value = lock:claim(keyFor(player), newProfile())
+	if not ok or player.Parent ~= Players then
+		return false
+	end
+	frozen[player] = nil
+	profiles[player] = reconcile(value)
+	push(player)
+	return true
+end
+
 function PlayerData.init(remoteFolder, notify)
 	remotes = remoteFolder
 
@@ -295,6 +359,9 @@ function PlayerData.init(remoteFolder, notify)
 	if ok then
 		store = result
 		storeAvailable = true
+		if LOCKED then
+			lock = require(script.Parent.SessionLock).new({ store = store })
+		end
 	else
 		warn("PlayerData: DataStores unavailable (" .. tostring(result) .. "). Progress is kept in memory only. In Studio, enable Game Settings > Security > Enable Studio Access to API Services.")
 		-- the HUD shows a "progress isn't saving" warning to players
@@ -322,7 +389,15 @@ function PlayerData.init(remoteFolder, notify)
 	end
 	Players.PlayerRemoving:Connect(function(player)
 		local profile = profiles[player]
-		if profile and not profile.doNotSave then
+		if LOCKED and storeAvailable then
+			-- frozen (handed off) players already released their save; everyone else releases it now
+			if profile and not profile.doNotSave then
+				lock:release(keyFor(player), profile)
+			elseif frozen[player] and lock:owns(keyFor(player)) then
+				lock:release(keyFor(player), frozen[player]) -- a hand-off whose release failed: release it now
+			end
+			frozen[player] = nil
+		elseif profile and not profile.doNotSave then
 			save(player)
 		end
 		profiles[player] = nil
@@ -332,7 +407,11 @@ function PlayerData.init(remoteFolder, notify)
 	game:BindToClose(function()
 		for player, profile in profiles do
 			if not profile.doNotSave then
-				save(player)
+				if LOCKED and storeAvailable then
+					lock:release(keyFor(player), profile)
+				else
+					save(player)
+				end
 			end
 		end
 	end)
@@ -341,7 +420,13 @@ function PlayerData.init(remoteFolder, notify)
 			task.wait(AUTOSAVE_SECONDS)
 			for player, profile in profiles do
 				if not profile.doNotSave then
-					task.spawn(save, player)
+					if LOCKED and storeAvailable and not dirty[player] then
+						task.spawn(function()
+							lock:heartbeat(keyFor(player)) -- keeps the session alive while unchanged
+						end)
+					else
+						task.spawn(save, player)
+					end
 				end
 			end
 		end

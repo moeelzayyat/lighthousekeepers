@@ -187,4 +187,25 @@ if Config.PROTOTYPE_SHORT_RUN then
 	Config.NIGHT_SECONDS = 90
 end
 
+-- Multi-ship TEST EXPERIENCE ("LK Multiship Test", branch multiship-test). Everything below takes effect ONLY when
+-- this code runs in that experience (GameId match). In production Lighthouse Keepers the GameId never matches, so
+-- these switches can never turn anything on there. Each switch also needs the owner's go-ahead before it is set.
+Config.MULTISHIP_TEST = {
+	gameId = 0, -- the test experience's GameId (0 until the owner creates it)
+	harborPlaceId = 0, -- its Harbor (start) place
+	islePlaceId = 0, -- its Lighthouse Isle place
+	multiShip = false, -- two ships in the harbor (Studio-safe; departures are simulated while teleport is off)
+	sessionLock = false, -- PlayerData uses SessionLock on the TEST store (real DataStore writes: owner approval)
+	teleport = false, -- real voyages to reserved Isle servers (owner approval)
+}
+Config.IS_MULTISHIP_TEST = Config.MULTISHIP_TEST.gameId ~= 0 and game.GameId == Config.MULTISHIP_TEST.gameId
+if Config.IS_MULTISHIP_TEST then
+	local T = Config.MULTISHIP_TEST
+	Config.MULTI_SHIP_ENABLED = T.multiShip == true
+	Config.TELEPORT_ENABLED = T.teleport == true and T.multiShip == true
+	Config.SESSION_LOCK_ENABLED = T.sessionLock == true
+	Config.HARBOR_PLACE_ID = T.harborPlaceId
+	Config.ISLE_PLACE_ID = T.islePlaceId
+end
+
 return Config
